@@ -1,0 +1,617 @@
+ok. there have been some changes. currrently the inference.py script is how we run mcgaze. previously when we used the resource_section_for_mcgaze (which is a section of code from aonther file), we got good resource testing outputs for mcgaze, so remembre that. I also provide below resource_test.py that we used for another gaze model (called gaze3d), that one does everything i want as far as resource testing for a gaze model is concerned. In this light, implement me resource_test.py for mcgaze.
+
+inference.py:
+# inference.py
+# Minimal-change inference wrapper for MCGaze.
+# IMPORTANT: We intentionally keep the fragile "metas/config" setup exactly as in demo_real_time.py.
+# Only image feeding is adjusted to actually use the provided clip frames.
+
+from mmcv.parallel import collate, scatter
+
+import cv2
+import torch
+import numpy as np
+import sys
+sys.path.insert(0, "..")
+from mmdet.apis import init_detector
+from mmdet.datasets.pipelines import Compose
+
+# ====== BEGIN: directly copied config/init bits from demo_real_time.py (unchanged) ======
+# use gaze360 or l2cs by changing these paths (kept verbatim)
+model = init_detector(
+        '../configs/multiclue_gaze/multiclue_gaze_r50_l2cs.py',
+        '../ckpts/multiclue_gaze_r50_l2cs.pth',
+        device="cuda:0",
+        cfg_options=None,)
+
+# model = init_detector(
+#         '../configs/multiclue_gaze/multiclue_gaze_r50_gaze360.py',
+#         '../ckpts/multiclue_gaze_r50_gaze360.pth',
+#         device="cuda:0",
+#         cfg_options=None,)
+
+cfg = model.cfg
+test_pipeline = Compose(cfg.data.test.pipeline[1:])
+
+def load_datas(data, test_pipeline, datas):
+    datas.append(test_pipeline(data))
+# ====== END: copied init bits ======
+
+
+def _to_unit(vec_np: np.ndarray) -> np.ndarray:
+    """Normalize vectors along last dim; safe for zeros."""
+    eps = 1e-8
+    n = np.linalg.norm(vec_np, axis=-1, keepdims=True)
+    n = np.maximum(n, eps)
+    return vec_np / n
+
+
+def _build_clip_datas_from_frames(frames_bgr, approx_l: int = None):
+    """
+    Build the 'datas' list (per-frame items) using the SAME pipeline as demo_real_time.infer.
+    frames_bgr: list[np.ndarray (H,W,3)] in BGR.
+    """
+    datas_list = []
+    for frame in frames_bgr:
+        h_n, w_n, _ = frame.shape  # (H,W,3)
+        l = max(h_n, w_n) // 2 if approx_l is None else approx_l
+
+        # Exactly as demo: filename=111, ori_filename=111, ori_shape=(2l,2l,3)
+        cur_data = dict(
+            filename=111,
+            ori_filename=111,
+            img=frame,  # BGR; Normalize(to_rgb=True) will handle channel swap
+            img_shape=(h_n, w_n, 3),
+            ori_shape=(2 * l, 2 * l, 3),
+            img_fields=['img'],
+        )
+        load_datas(cur_data, test_pipeline, datas_list)
+
+    return datas_list
+
+
+def _forward_mcgaze_with_hacks(datas_list, clip_len):
+    """
+    EXACTLY mirrors the fragile meta/config manipulations in demo_real_time.infer,
+    but (key change) we stack the actual per-frame tensors *before* collate.
+    Steps:
+      1) Extract each frame's post-pipeline tensor from datas_list (shape (3,H,W)).
+      2) Stack to imgs_stack (T,3,H,W).
+      3) Create a 'base' batch by collating ONLY the first item (samples_per_gpu=1).
+      4) Overwrite img_metas (repeat the same dict clip_len times) and set img=[imgs_stack].
+      5) Scatter to GPU and run the model.
+    """
+    # 1) Extract per-frame tensors from pipeline outputs *before* collate
+    per_frame_tensors = []
+    for sample in datas_list:
+        img_obj = sample['img']
+        img = img_obj.data if hasattr(img_obj, 'data') else img_obj
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img)
+        if not torch.is_tensor(img):
+            raise TypeError(f"Unexpected img type: {type(img)}")
+        if img.dim() == 4 and img.size(0) == 1:
+            img = img.squeeze(0)  # (1,3,H,W) -> (3,H,W)
+        assert img.dim() == 3, f"Expected (3,H,W), got {tuple(img.shape)}"
+        per_frame_tensors.append(img)
+
+    # 2) Stack into (T,3,H,W)
+    imgs_stack = torch.stack(per_frame_tensors, dim=0)
+
+    # 3) Create a minimal 'base' batch by collating ONLY the first item
+    base = collate([datas_list[0]], samples_per_gpu=1)
+    base['img_metas'] = base['img_metas'].data
+    base['img'] = base['img'].data
+
+    # ====== BEGIN: fragile hack zone — keep constants *exactly* as in demo_real_time.py ======
+    base["img_metas"] = [{
+        'filename': 0,
+        'ori_filename': 111,
+        'ori_shape': (254, 254, 3),
+        'img_shape': (448, 448, 3),
+        'pad_shape': (448, 448, 3),
+        'scale_factor': np.array([1.7637795, 1.7637795, 1.7637795, 1.7637795], dtype=float),
+        'flip': False,
+        'flip_direction': None,
+        'img_norm_cfg': {
+            'mean': np.array([123.675, 116.28 , 103.53 ], dtype=float),
+            'std':  np.array([ 58.395,  57.12 ,  57.375], dtype=float),
+            'to_rgb': True
+        }
+    }]
+    base['img_metas'] = [[base['img_metas'][0] for _ in range(clip_len)]]
+
+    # KEY CHANGE: use the real frames stack (T,3,H,W)
+    base['img'] = [imgs_stack]
+    # ====== END: fragile hack zone ======
+
+    datas = scatter(base, ["cuda:0"])[0]
+
+    # (Optional short sanity print; comment out if noisy)
+    # print("imgs_stack shape:", tuple(imgs_stack.shape))
+    # print("len(img_metas[0]):", len(base['img_metas'][0]))
+
+    with torch.no_grad():
+        (det_bboxes, det_labels), det_gazes = model(
+            return_loss=False,
+            rescale=True,
+            format=False,
+            **datas
+        )
+
+    gaze_dim = det_gazes['gaze_score'].size(1)
+    det_fusion_gaze = det_gazes['gaze_score'].view((det_gazes['gaze_score'].shape[0], 1, gaze_dim))
+    gaze_np = det_fusion_gaze.cpu().numpy()[:, 0, :]
+    gaze_np = _to_unit(gaze_np)
+    return gaze_np
+
+
+def estimate_from_clip(clip, clip_size=None):
+    """
+    Run MCGaze on a full clip and return per-frame gaze vectors.
+
+    Args:
+        clip: list[np.ndarray] or np.ndarray of shape (T, H, W, 3), frames in BGR.
+        clip_size: optional; if provided, we use min(len(clip), clip_size) frames (from the end).
+                   If None, we use all frames.
+
+    Returns:
+        np.ndarray of shape (T_used, 3): unit gaze vectors per frame (model's output coordinate frame).
+    """
+    # Ensure list of np.ndarrays
+    if isinstance(clip, np.ndarray):
+        if clip.ndim != 4 or clip.shape[-1] != 3:
+            raise ValueError(f"clip ndarray must be (T,H,W,3), got {clip.shape}")
+        frames_bgr = [clip[i] for i in range(clip.shape[0])]
+    elif isinstance(clip, list):
+        frames_bgr = clip
+    else:
+        raise TypeError("clip must be a list of frames or a (T,H,W,3) ndarray")
+
+    T = len(frames_bgr)
+    if T == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    # Determine how many frames to use (local-only; no globals)
+    use_T = T if clip_size is None else min(T, clip_size)
+    frames_bgr_used = frames_bgr[-use_T:]
+
+    # Build per-frame datas with SAME pipeline as demo_real_time.infer
+    datas_list = _build_clip_datas_from_frames(frames_bgr_used)
+
+    # Forward through MCGaze with the EXACT same meta/config hacks (only images differ)
+    gaze_np = _forward_mcgaze_with_hacks(datas_list, clip_len=len(frames_bgr_used))
+
+    return gaze_np
+
+
+# ----------------- Tiny smoke test (optional) -----------------
+if __name__ == "__main__":
+    import os
+    sample_path = "/home/kovan/FaceAndGaze/MCGaze_demo/1.png"  # put a real head crop here
+    if os.path.exists(sample_path):
+        img = cv2.imread(sample_path)  # BGR
+        T = 5
+        clip = [img.copy() for _ in range(T)]
+        out = estimate_from_clip(clip)  # -> (T, 3)
+        print("Output shape:", out.shape)
+        print(out[:2])
+    else:
+        print("No real frame found for smoke test; skipping __main__ run.")
+
+resource_section_for_mcgaze:
+
+def infer(cropped_img,model,clip,l, datas, clip_size=-1):
+   times_ms, vram_alloc, vram_reserved = [], [], []   
+   if clip_size == -1:
+       clip_size = CLIP_SIZE
+   #cropped_img = scatter(cropped_img, ["cuda:0"])[0]
+   #l = int(max(head_bboxes[3]-head_bboxes[1],head_bboxes[2]-head_bboxes[0])*0.8)
+   #cropped_img = cropped_img.cpu().detach().numpy()[0].T       
+   w_n,h_n,_ = cropped_img.shape
+   cur_data = dict(filename=111,ori_filename=111,img=cropped_img,img_shape=(w_n,h_n,3),ori_shape=(2*l,2*l,3),img_fields=['img'])
+   tmp_loaded_datas = []
+   load_datas(cur_data,test_pipeline,tmp_loaded_datas)
+
+
+   if len(datas)<clip_size:
+       datas.extend(tmp_loaded_datas)
+   else:
+       datas.pop(0)
+       datas.extend(tmp_loaded_datas)
+
+
+   with torch.no_grad():
+       datas = sorted(datas, key=lambda x:x['img_metas'].data['filename']) # 按帧顺序 img名称从小到大
+       datas = collate(datas, samples_per_gpu=1) # 用来形成batch用的
+       datas['img_metas'] = datas['img_metas'].data
+       datas['img'] = datas['img'].data
+       datas["img_metas"] = [{'filename': 0, 'ori_filename': 111, 'ori_shape': (254, 254, 3), 'img_shape': (448, 448, 3), 'pad_shape': (448, 448, 3), 'scale_factor': np.array([1.7637795, 1.7637795, 1.7637795, 1.7637795], dtype=float), 'flip': False, 'flip_direction': None, 'img_norm_cfg': {'mean': np.array([123.675, 116.28 , 103.53 ], dtype=float), 'std': np.array([58.395, 57.12 , 57.375], dtype=float), 'to_rgb': True}}]
+       datas['img_metas'] = [[datas['img_metas'][0] for _ in range(clip_size)]] #[datas['img_metas'][0], datas['img_metas'][0], datas['img_metas'][0], datas['img_metas'][0], datas['img_metas'][0], datas['img_metas'][0], datas['img_metas'][0]]
+
+
+       datas['img'] = [torch.stack([datas['img'][0][0] for _ in range(clip_size)], axis=0)]
+
+
+       # print(len(datas["img_metas"]), len(datas["img_metas"][0]), len(datas["img_metas"][0][0]))
+       # print(len(datas["img"]), len(datas["img"][0]), len(datas["img"][0][0]))
+       datas = scatter(datas, ["cuda:0"])[0]
+       #(det_bboxes, det_labels), det_gazes = model.simple_test(imgs=datas['img'], img_metas=datas['img_metas'])
+
+
+       device = next(model.parameters()).device  # model device
+       use_cuda = device.type == 'cuda'
+       if use_cuda:
+           torch.cuda.reset_peak_memory_stats(device)
+           torch.cuda.synchronize(device)
+
+
+       t0 = time.perf_counter()
+
+
+       (det_bboxes, det_labels), det_gazes = model(
+               return_loss=False,
+               rescale=True,
+               format=False,# 返回的bbox既包含face_bboxes也包含head_bboxes
+               **datas)    # 返回的bbox格式是[x1,y1,x2,y2],根据return_loss函数来判断是forward_train还是forward_test.
+       if use_cuda:
+           torch.cuda.synchronize(device)
+       t1 = time.perf_counter()
+       times_ms.append((t1 - t0) * 1000.0)
+
+
+       if use_cuda:
+           vram_alloc.append(torch.cuda.max_memory_allocated(device) / (1024 ** 2))
+           vram_reserved.append(torch.cuda.max_memory_reserved(device) / (1024 ** 2))
+       else:
+           vram_alloc.append(None)
+           vram_reserved.append(None)
+  
+       print("times_ms:", times_ms)
+       print("vram_alloc:", vram_alloc)
+       print("vram_reserved:", vram_reserved)
+  
+   gaze_dim = det_gazes['gaze_score'].size(1)
+   det_fusion_gaze = det_gazes['gaze_score'].view((det_gazes['gaze_score'].shape[0], 1, gaze_dim))
+   clip['gaze_p'].append(det_fusion_gaze.cpu().numpy())
+
+resource_test.py for gaze3d:
+
+#!/usr/bin/env python3
+import json
+import time
+import statistics as stats
+from typing import Optional, Tuple, Dict
+
+import torch
+import torch.nn as nn
+
+
+# ------------------------------- FLOPs helpers (no external adapter) -------------------------------
+
+def _has_fvcore() -> bool:
+    try:
+        import fvcore  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _has_thop() -> bool:
+    try:
+        import thop  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def compute_flops_fvcore_return_tensor(model: nn.Module,
+                                       device: torch.device,
+                                       sample_btchw: torch.Tensor,
+                                       tensor_key: str = "gaze") -> Optional[int]:
+    """
+    Return FLOPs (int) for a single forward using fvcore, or None if unavailable.
+    Monkey-patches model.forward so it returns a Tensor (out[tensor_key]) instead of a dict.
+    """
+    from fvcore.nn import FlopCountAnalysis
+
+    sample_btchw = sample_btchw.to(device, non_blocking=True).to(torch.float32)
+    model.eval()
+
+    orig_forward = model.forward
+    try:
+        def proxy_forward(x, *args, **kwargs):
+            out = orig_forward(x, *args, **kwargs)
+            # Gaze3D forward returns a dict like {"gaze": (B,T,3)}
+            return out[tensor_key]
+
+        model.forward = proxy_forward  # monkey-patch
+
+        with torch.no_grad():
+            fca = FlopCountAnalysis(model, (sample_btchw,))
+            flops = int(fca.total())
+        return flops if flops > 0 else None
+    finally:
+        model.forward = orig_forward  # always restore
+
+
+def compute_macs_thop_return_tensor(model: nn.Module,
+                                    device: torch.device,
+                                    sample_btchw: torch.Tensor,
+                                    tensor_key: str = "gaze") -> Optional[int]:
+    """
+    Return MACs (int) for a single forward using THOP, or None if unavailable.
+    Monkey-patches model.forward so it returns a Tensor (out[tensor_key]) instead of a dict.
+    """
+    from thop import profile
+
+    sample_btchw = sample_btchw.to(device, non_blocking=True).to(torch.float32)
+    model = model.to(device).eval()
+
+    orig_forward = model.forward
+    try:
+        def proxy_forward(x, *args, **kwargs):
+            out = orig_forward(x, *args, **kwargs)
+            return out[tensor_key]
+
+        model.forward = proxy_forward
+
+        with torch.no_grad():
+            macs, _ = profile(model, inputs=(sample_btchw,), verbose=False)
+        return int(macs) if macs and macs > 0 else None
+    finally:
+        model.forward = orig_forward  # always restore
+
+
+# ----------------------------------- Wrapper -----------------------------------
+
+class Gaze3DWrapper:
+    """
+    Resource tester for your Gaze3D (GaT) model.
+    Assumes model(X) returns a dict with key "gaze" shaped (B, T, 3).
+    """
+    def __init__(self, model: nn.Module, device: torch.device):
+        self.model = model.eval().to(device)
+        self.device = device
+
+    def _count_params(self) -> Tuple[int, int]:
+        total = sum(p.numel() for p in self.model.parameters())
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        return int(total), int(trainable)
+
+    def _try_get_flops(self, sample_btchw: torch.Tensor) -> Optional[int]:
+        """
+        Try fvcore (FLOPs). If that fails, try THOP (MACs) and convert to FLOPs≈2×MACs.
+        Returns FLOPs (int) or None.
+        """
+        if _has_fvcore():
+            try:
+                flops = compute_flops_fvcore_return_tensor(self.model, self.device, sample_btchw, tensor_key="gaze")
+                if flops is not None and flops > 0:
+                    return int(flops)
+            except Exception as e:
+                print(f"[FLOPs] fvcore failed: {e}")
+
+        if _has_thop():
+            try:
+                macs = compute_macs_thop_return_tensor(self.model, self.device, sample_btchw, tensor_key="gaze")
+                if macs is not None and macs > 0:
+                    return int(macs * 2)  # FLOPs ≈ 2 × MACs
+            except Exception as e:
+                print(f"[FLOPs] thop failed: {e}")
+
+        return None
+
+    def _time_one(self, x: torch.Tensor, use_cuda: bool) -> float:
+        """
+        Return latency (ms) for one forward (B=1).
+        Uses CUDA events on GPU for precision.
+        """
+        if use_cuda:
+            starter = torch.cuda.Event(enable_timing=True)
+            ender = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize(self.device)
+            starter.record()
+            _ = self.model(x)
+            ender.record()
+            torch.cuda.synchronize(self.device)
+            return float(starter.elapsed_time(ender))  # ms
+        else:
+            t0 = time.perf_counter()
+            _ = self.model(x)
+            t1 = time.perf_counter()
+            return (t1 - t0) * 1000.0
+
+    def resource_test(self,
+                      trials: int = 100,
+                      clip_len: int = 1,
+                      shape_hw: Tuple[int, int] = (224, 224),
+                      dtype: torch.dtype = torch.float32,
+                      seed: int = 1234) -> Dict:
+        """
+        Measure params, FLOPs (per forward at given T,H,W), latency distribution and VRAM.
+        All tests use batch_size=1; input tensor shape = [1, T, 3, H, W].
+        """
+        H, W = shape_hw
+        C = 3
+        T = int(clip_len)
+        assert T >= 1
+        torch.manual_seed(seed)
+        use_cuda = (self.device.type == "cuda" and torch.cuda.is_available())
+        self.model.eval()
+        torch.set_grad_enabled(False)
+        torch.backends.cudnn.benchmark = True  # speed for fixed shapes
+
+        # Static metrics
+        total_params, trainable_params = self._count_params()
+        sample = torch.randn(1, T, C, H, W, device=self.device, dtype=dtype)
+        flops = self._try_get_flops(sample.detach().clone().cpu())
+
+        # Warm-up
+        warm = torch.zeros(1, T, C, H, W, dtype=dtype, device=self.device)
+        for _ in range(5):
+            _ = self.model(warm)
+        if use_cuda:
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+
+        # Distributions
+        times_ms = []
+        vram_alloc = []
+        vram_reserved = []
+
+        for _ in range(trials):
+            x = torch.randn(1, T, C, H, W, device=self.device, dtype=dtype)
+
+            if use_cuda:
+                torch.cuda.reset_peak_memory_stats(self.device)
+
+            t_ms = self._time_one(x, use_cuda=use_cuda)
+            times_ms.append(t_ms)
+
+            if use_cuda:
+                vram_alloc.append(torch.cuda.max_memory_allocated(self.device) / (1024 ** 2))
+                vram_reserved.append(torch.cuda.max_memory_reserved(self.device) / (1024 ** 2))
+            else:
+                vram_alloc.append(None)
+                vram_reserved.append(None)
+
+        def summarize(vals):
+            vals_num = [v for v in vals if v is not None]
+            if not vals_num:
+                return {"mean": None, "std": None, "p50": None, "p95": None, "min": None, "max": None}
+            return {
+                "mean": float(stats.fmean(vals_num)),
+                "std": float(stats.pstdev(vals_num)) if len(vals_num) > 1 else 0.0,
+                "p50": float(torch.tensor(vals_num).median().item()),
+                "p95": float(torch.quantile(torch.tensor(vals_num), 0.95).item()),
+                "min": float(min(vals_num)),
+                "max": float(max(vals_num)),
+            }
+
+        results = {
+            "model": "gaze3d",
+            "device": str(self.device),
+            "dtype": str(dtype).replace("torch.", ""),
+            "trials": int(trials),
+            "input_shape": [1, T, C, H, W],
+            "parameters_total": total_params,
+            "parameters_trainable": trainable_params,
+            "flops_per_forward": int(flops) if flops is not None else None,  # T,H,W specific
+            "latency_ms": {
+                "all": times_ms,
+                "summary": summarize(times_ms),
+            },
+            "vram_peak_allocated_mb": {
+                "all": vram_alloc,
+                "summary": summarize(vram_alloc),
+            },
+            "vram_peak_reserved_mb": {
+                "all": vram_reserved,
+                "summary": summarize(vram_reserved),
+            },
+        }
+        return results
+
+
+# ----------------------------------- CLI / Demo -----------------------------------
+
+if __name__ == "__main__":
+    import numpy as np
+
+    # ==== Edit these as needed ====
+    ckpt_path    = "./checkpoints/gat_gaze360.ckpt"
+    device_str   = "cuda:0" if torch.cuda.is_available() else "cpu"
+    trials       = 1000
+    clip_len     = 8          # T=1 for image modality; use >1 for clip testing
+    height       = 224
+    width        = 224
+    dtype_str    = "float32"  # "float32" | "float16" | "bfloat16"
+    seed         = 1234
+    out_path     = f"resource_test_results_gaze3d_clip_len_{clip_len}.npz"
+    summary_out  = f"resource_test_results_gaze3d_clip_len_{clip_len}_summary.json"
+    # ==============================
+
+    # Import your estimator wrapper
+    from gaze_model_gaze3d import Gaze3D  # <-- adapt to your actual module path
+
+    device = torch.device(device_str)
+    dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+    dtype = dtype_map[dtype_str]
+
+    # Build model
+    model_api = Gaze3D(
+        ckpt_path=ckpt_path,
+        device=device_str,
+        clip_len=clip_len,
+        resize_hw=(height, width),
+        rectification=False,
+    )
+    wrapper = Gaze3DWrapper(model=model_api.model, device=device)
+
+    # Run tests
+    results = wrapper.resource_test(
+        trials=trials,
+        clip_len=clip_len,
+        shape_hw=(height, width),
+        dtype=dtype,
+        seed=seed,
+    )
+
+    # Optional: THOP quick check (store MACs & 2×MACs)
+    thop_macs = None
+    thop_flops = None
+    if _has_thop():
+        macs = compute_macs_thop_return_tensor(wrapper.model, device,
+                                               torch.randn(1, clip_len, 3, height, width))
+        if macs is not None:
+            thop_macs = int(macs)
+            thop_flops = int(2 * macs)
+            print(f"THOP MACs: {thop_macs} -> FLOPs≈ {thop_flops}")
+    results["thop_macs"] = thop_macs
+    results["thop_flops"] = thop_flops
+
+    # Pretty print
+    print(json.dumps(results, indent=2))
+
+    # Save everything as .npz
+    save_dict = {}
+    for k, v in results.items():
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                if isinstance(vv, dict):
+                    for kkk, vvv in vv.items():
+                        save_dict[f"{k}_{kkk}"] = np.array(vvv) if vvv is not None else np.array([])
+                elif isinstance(vv, list):
+                    save_dict[f"{k}_{kk}"] = np.array(vv)
+                else:
+                    save_dict[f"{k}_{kk}"] = np.array([vv]) if vv is not None else np.array([])
+        elif isinstance(v, list):
+            save_dict[k] = np.array(v)
+        elif v is None:
+            save_dict[k] = np.array([])
+        else:
+            save_dict[k] = np.array([v])
+
+    np.savez(out_path, **save_dict)
+    print(f"Saved results to {out_path}")
+
+    # Save compact summary JSON (easy to skim in editor)
+    summary = {
+        "model": results["model"],
+        "device": results["device"],
+        "dtype": results["dtype"],
+        "trials": results["trials"],
+        "input_shape": results["input_shape"],
+        "parameters_total": results["parameters_total"],
+        "parameters_trainable": results["parameters_trainable"],
+        "flops_per_forward": results["flops_per_forward"],
+        "thop_macs": results["thop_macs"],
+        "thop_flops": results["thop_flops"],
+        "latency_ms": results["latency_ms"]["summary"],
+        "vram_peak_allocated_mb": results["vram_peak_allocated_mb"]["summary"],
+        "vram_peak_reserved_mb": results["vram_peak_reserved_mb"]["summary"],
+    }
+    with open(summary_out, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"Saved summary to {summary_out}")

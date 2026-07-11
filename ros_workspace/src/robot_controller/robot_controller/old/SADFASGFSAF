@@ -1,0 +1,1830 @@
+import traceback
+import rclpy
+import rclpy.exceptions
+import rclpy.executors
+from rclpy.node import Node
+import math
+import threading
+import time
+from playsound import playsound
+import numpy as np
+
+from matplotlib import pyplot as plt
+
+from scipy.spatial.transform import Rotation as R
+
+import rclpy.time
+
+from .robotiq_gripper import RobotiqGripper as robotiq_gripper
+
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64MultiArray
+
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+
+from .jacobian.ur5e_kinematics import *
+
+from .breathing import breathing_src as breathing
+
+from .util import CustomTimer
+
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+from std_msgs.msg import Bool
+from enum import Enum
+import os
+import sys
+import robot_controller.gaze.config as gaze_config
+from robot_controller.util import quaternion_to_homogeneous_matrix
+
+class RobotState(Enum):
+    START = 0
+    PICKING = 1
+    PLACING = 2
+    BREATHING_GAZING = 3
+    END = 4
+
+data = []
+data_c = []
+
+gaze_velocities_arr = []
+freq_arr = []
+
+head_bend_falg = False
+
+def set_velocity_command_modifier(modifier, modification, reset_flag=False):
+    global head_bend_falg
+    for i in range(len(modifier)):
+        modifier[i] = modification[i]
+    # print("Velocity command modifier: ", modifier, "at ", time.time())
+    if reset_flag:
+        head_bend_falg = True
+
+PICK_UP_MAX_HEIGHT = 0.8
+PICK_UP_MIN_HEIGHT = 0.7
+
+PICK_UP_AREA = np.array([np.array([1.03, -0.49]), np.array([1.44, -0.49]), np.array([1.44, -0.04]), np.array([1.03, -0.04])])
+PLACEMENT_AREA = np.array([np.array([1.35, 0.52]), np.array([1.23, 0.52]), np.array([1.10, 0.52]), np.array([1.35, 0.37]), np.array([1.23, 0.37]), np.array([1.10, 0.37])])
+
+already_picked_up = []
+
+def is_in_pick_up_area(point):
+    if point[2] > PICK_UP_MIN_HEIGHT and point[2] < PICK_UP_MAX_HEIGHT:
+        if point[0] > PICK_UP_AREA[0][0] and point[0] < PICK_UP_AREA[1][0]:
+            if point[1] > PICK_UP_AREA[0][1] and point[1] < PICK_UP_AREA[2][1]:
+                return True
+    return False
+
+class GripperController:
+    def __init__(self, host, port):
+        self.host = host # The robot's computer address
+        self.port = port # The gripper's port number
+        self.gripper = None
+        self._init_gripper()
+
+    def _init_gripper(self):
+        print("Creating gripper...")
+        self.gripper = robotiq_gripper()
+        print("Connecting to gripper...")
+        self.gripper.connect(self.host, self.port)
+        print("Activating gripper...")
+        self.gripper.activate(auto_calibrate=False)
+        
+        self.close()
+
+    def open(self, speed=255, force=255):
+        self.gripper.move_and_wait_for_pos(0, speed, force)
+        # self.pub.publish(String("0.0"))
+
+    def close(self, speed=255, force=255):
+        self.gripper.move_and_wait_for_pos(255, speed, force)
+        # self.pub.publish(String("0.7"))
+
+    def close_async(self, speed=255, force=255):
+        self.gripper.move(255, speed, force)
+        
+    def open_async(self, speed=255, force=255):
+        self.gripper.move(0, speed, force)
+
+    def move_gripper(self, pos, speed=255, force=255):
+        pos = 0 if pos < 0 else (255 if pos > 255 else pos)
+        self.gripper.move_and_wait_for_pos(pos, speed, force)
+        
+    def current_pos(self):        
+        return self.gripper.get_current_position()
+    
+    def is_holding(self):
+        prev_pos = self.gripper.get_current_position()
+        if prev_pos < 50:
+            return False
+        #else:
+        #    print("WHY ARE WE HERE, JUST TO SUFFER?!")
+        self.gripper.move_and_wait_for_pos(prev_pos+1,255,255)
+        if (abs(self.gripper.get_current_position()-prev_pos)==0) and (self.gripper.get_current_position() < 100):
+            return True
+        else:
+            return False
+
+def make_parabola(start_pos, mid_pos, end_pos, amt_points=100):
+    
+    x_axis = (end_pos - start_pos) / np.linalg.norm(end_pos - start_pos)
+    z_axis = np.cross(x_axis, mid_pos - start_pos)
+    z_norm = np.linalg.norm(z_axis)
+    z_axis = z_axis / z_norm
+    y_axis = np.cross(z_axis, x_axis)
+    y_norm = np.linalg.norm(y_axis)
+    y_axis = y_axis / y_norm
+    orig_axis = start_pos #not an axis, dont know why i called it that - sometimes somethings just happen and all you can do is accept and move on
+    
+    x_axis = np.concatenate((x_axis, [0]))
+    y_axis = np.concatenate((y_axis, [0]))
+    z_axis = np.concatenate((z_axis, [0]))
+    orig_axis = np.concatenate((orig_axis, [1]))
+    
+    transform_matrix = np.array([x_axis, y_axis, z_axis, orig_axis])
+    transform_matrix = np.transpose(transform_matrix)
+    
+    print("Transform Matrix: ", transform_matrix)
+    
+    # -------------------------------
+    
+    vec_ie = end_pos - start_pos
+    vec_im = mid_pos - start_pos
+    
+    norm_ie = np.linalg.norm(vec_ie)
+    norm_im = np.linalg.norm(vec_im)
+    
+    cosalfa = np.dot(vec_ie, vec_im) / (norm_ie * norm_im)
+    sinalfa = np.sqrt(1 - cosalfa**2)
+        
+    vec_xm = cosalfa*norm_im
+    vec_ym = sinalfa*norm_im
+    
+    a = vec_ym/(vec_xm*vec_xm - vec_xm*norm_ie)
+    b = -a*norm_ie
+        
+    steps = np.linspace(0,1,num=amt_points,endpoint=False)
+    sample_points_x = np.interp(steps,[0,1],[0,norm_ie])    
+    
+    print("Sample Points: ", sample_points_x)
+    sample_points_y = []
+    
+    for i in range(len(sample_points_x)):        
+        sample_points_y.append(a*sample_points_x[i]**2 + b*sample_points_x[i])
+        
+    traj_points = []
+        
+    for i in range(len(sample_points_x)):        
+        traj_points.append((transform_matrix @ np.array([sample_points_x[i], sample_points_y[i], 0, 1]))[0:3])
+        print("Traj: ", traj_points[-1])
+    
+    return traj_points
+
+def three_point_cubic_spline(start_pos=None, start_derivative=None, mid0_pos=None, mid1_pos=None, end_derivative=None, end_pos=None):
+    
+    if start_pos is None or end_pos is None:
+        raise ValueError("Start and end positions must be provided.")
+    if mid0_pos is None and start_derivative is None:
+        raise ValueError("Either mid0 position or start derivative must be provided.")
+    if mid1_pos is None and end_derivative is None:
+        raise ValueError("Either mid1 position or end derivative must be provided.")
+    
+    p0 = start_pos
+    p1 = end_pos    
+    if mid0_pos is None:
+        mid0_pos = start_pos + start_derivative
+    if mid1_pos is None:
+        mid1_pos = end_pos + end_derivative
+    r0 = (mid0_pos - start_pos) / np.linalg.norm(mid0_pos - start_pos)
+    r1 = (end_pos - mid1_pos) / np.linalg.norm(end_pos - mid1_pos)
+    
+    p0x, p0y, p0z = p0[0], p0[1], p0[2]
+    p1x, p1y, p1z = p1[0], p1[1], p1[2]
+    r0x, r0y, r0z = r0[0], r0[1], r0[2]
+    r1x, r1y, r1z = r1[0], r1[1], r1[2]
+    
+    x_constraints = np.array([p0x, p1x, r0x, r1x])
+    y_constraints = np.array([p0y, p1y, r0y, r1y])
+    z_constraints = np.array([p0z, p1z, r0z, r1z])
+    
+    cubic_spline_inverse_matrix = np.array([[2, -2, 1, 1],
+                                            [-3, 3, -2, -1],
+                                            [0, 0, 1, 0],
+                                            [1, 0, 0, 0]])
+
+    
+    x_coefficients = cubic_spline_inverse_matrix @ x_constraints
+    y_coefficients = cubic_spline_inverse_matrix @ y_constraints
+    z_coefficients = cubic_spline_inverse_matrix @ z_constraints
+    
+    return x_coefficients, y_coefficients, z_coefficients
+
+def angular_wrap(angle):
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+def reverse_homogeneous_matrix(matrix):
+    new_matrix = np.eye(4)
+    new_matrix[0:3, 0:3] = np.transpose(matrix[0:3, 0:3])
+    new_matrix[0:3, 3] = -1 * np.transpose(matrix[0:3, 0:3]) @ matrix[0:3, 3]
+    return new_matrix
+
+class NewController(Node):
+
+    def init_joint_states(self):
+        # Get joint states
+        self.joint_states_global = {}
+        self.joint_state_sub = self.create_subscription(JointState, 'joint_states', self.joint_state_callback, 10)
+        
+        while not self.joint_states_global:
+            #self.get_logger().info('Waiting for joint states...')
+            rclpy.spin_once(self)
+        self.get_logger().info('Joint states received.')
+        
+    def init_velocity_controller(self):
+        # Publish velocity commands
+        self.velocityControllerTopic = "forward_velocity_controller/commands" # All movements should be done w.r.t. "base", not "base_link" or "world"
+        self.velocityControllerPub = self.create_publisher(Float64MultiArray, self.velocityControllerTopic, 10)
+        
+        while not self.velocityControllerPub.get_subscription_count():
+            #self.get_logger().info('Waiting for velocity controller to connect...')
+            rclpy.spin_once(self)
+        self.get_logger().info('Velocity controller connected.')
+
+    def init_tf(self):
+        self.tfBuffer = Buffer()
+        self.tfListener = TransformListener(self.tfBuffer, self)
+        can_transform = False
+        
+        while not can_transform:
+            try:
+                curr_ts = rclpy.time.Time()
+                can_transform = self.tfBuffer.can_transform("base", "wrist_3_link", curr_ts) and self.tfBuffer.can_transform("world", "base", curr_ts)
+                if can_transform:
+                    tf = self.tfBuffer.lookup_transform("world", "base_link", curr_ts).transform
+                    tf_quat = np.array([tf.rotation.x, tf.rotation.y, tf.rotation.z, tf.rotation.w])
+                    tf_trans = np.array([tf.translation.x, tf.translation.y, tf.translation.z])
+                    homog = quaternion_to_homogeneous_matrix(tf_quat, tf_trans)
+                    #sometimes an error occurs in the tf tree, and the transform from world to base_link is identity. In that case, we need to reinitialize the tfBuffer and tfListener until the tf tree is fixed.
+                    if np.equal(homog, np.eye(4)).all():
+                        self.tfBuffer = Buffer()
+                        self.tfListener = TransformListener(self.tfBuffer, self)
+                        can_transform = False   
+                #     gaze_target_tf = self.tfBuffer.lookup_transform("world", CAMERA_TRACKER, curr_ts).transform
+                #     base_tf = self.tfBuffer.lookup_transform("world", "base", curr_ts).transform
+                #     can_transform = gaze_target_tf.translation.x - base_tf.translation.x < 0.0
+            except Exception as e:
+                # time.sleep(0.1) @ToDo maybe sleep a bit 
+                print(e)
+                pass
+            finally:
+                if can_transform:
+                    self.get_logger().info('TF tree received.')
+                    break
+                else:
+                    rclpy.spin_once(self)
+
+    def init_gripper(self):
+        # Initialize gripper
+        self.robot_ip = "192.168.1.102"
+        self.gripper_port = 63352
+        self.gripper = GripperController(self.robot_ip, self.gripper_port)
+        
+        #self.gripper.open()
+        self.get_logger().info('Gripper opened.')
+        #self.gripper.close()
+        self.get_logger().info('Gripper closed, gripper ready to go.')
+
+    def init_breather(self):
+        # Set breathing parameters 
+        self.breathe_dict = {}
+        self.breathe_dict["control_rate"] = self.control_rate
+
+        # Set breathe vector direction in base frame
+        breathe_vec = np.array([0., 0., 1.])  # named as r in the paper
+        breathe_vec = breathe_vec / np.linalg.norm(breathe_vec) if np.all(breathe_vec > 0) else breathe_vec
+        self.breathe_dict["breathe_vec"] = breathe_vec
+
+        # Human breathing data based breathing velocity profile function f(·)
+        human_data_path = "/home/kovan/USTA/src/robot_controller/robot_controller/breathing/breathe_data.npy"
+        f = np.load(human_data_path)               
+        self.breathe_dict["f"] = f
+
+        # FAST: period = 2, amplitude = 1.2
+        # DEFAULT: period = 4, amplitude = 1.0
+
+        # session_speed = exp_speed.Adaptive # deal with later
+        
+        # self.breathe_period, amplitude = 2, 1.4 #get_session_parameters(session_speed)
+        # Arazin degerleri 4, 1
+        self.breathe_period, amplitude = 4, 1.5
+        freq = 1.0 / self.breathe_period  # Named as beta in the paper
+        self.breathe_dict["freq"] = freq
+        self.breathe_dict["amplitude"] = amplitude
+
+        self.num_of_total_joints = 6  # UR5e has 6 joints
+        # Use at least 3 joints for breathing, below that, it is not effective
+        self.num_of_breathing_joints = 3  # Number of body joints starting from base towards to end effector
+        self.breathe_dict["num_of_joints"] = self.num_of_breathing_joints
+
+        self.breathe_dict["compensation"] = False
+        self.breathe_dict["filter"] = True
+        self.breathe_controller = breathing.Breather(self.breathe_dict)
+
+    def set_gaze_test_circular_movement_config(self, config):
+        self.gaze_test_circular_movement_config = config
+
+    def get_gaze_test_circular_movement_config(self, config_name):
+        return self.gaze_test_circular_movement_config[config_name]
+
+    def init_gaze_test_circular_movement(self):
+        self.gaze_test_circular_movement_ongoing = False
+        self.set_gaze_test_circular_movement_config(gaze_config.get_circular_movement_config())
+        self.create_publisher_to_start_recording_for_gaze_test_circular_movement()
+        self.create_sub_to_start_gaze_test_circular_movement()
+        self.circular_movement_triggered = threading.Event()
+        self.should_continue_circular_movement_loop = True
+
+    def __init__(self):
+        super().__init__('new_controller')
+        # Sanity check at the start of node (The phrases are very unprofessionally taken from my favorite anime, Serial Experiments Lain)
+        self.get_logger().info('Present day,')
+        
+        # Initialize control rate
+        self.control_rate = 500  # Hz
+        self.ros_rate = self.create_rate(self.control_rate, self.get_clock())
+        
+        self.base = "base"
+        self.eef = "wrist_3_link"
+        self.world = "world"        
+        
+        self.init_joint_states()
+        
+        self.init_velocity_controller()
+        
+        self.init_tf()
+        
+        self.base_to_world_homogeneous = np.array([
+            [-0.7071068, 0.7071068, 0.0, 1.7513],
+            [-0.7071068, -0.7071068, 0.0, 0.0955],
+            [0.0, 0.0, 1.0, 0.7347],
+            [0.0, 0.0, 0.0, 1.0]
+        ])
+        
+        self.world_to_base_homogeneous = reverse_homogeneous_matrix(self.base_to_world_homogeneous)
+        
+        self.init_gripper()
+        
+        self.init_breather()
+        self.use_helmet = True
+        self.tf_name = "rigid_body_2" if self.use_helmet else "exp/head"
+        self.breathe_frequency = self.breathe_dict["freq"]
+        
+        self.vel_comm_ind = 0
+        
+        self.prev_velocities = np.zeros(6)
+        
+        self.home_pos = np.array([-0.8, -1.73, -2.1,  1.1,  1.52,  3.16])
+        self.gripper_length = 0.17
+        
+        self.traj_publisher = self.create_publisher(MarkerArray, "trajectory", 10)
+        self.delta_publisher = self.create_publisher(Marker, "delta", 10)
+        self.prev_delta = np.zeros(3)
+        self.prev_head_in_w1 = np.zeros(3)
+        self.prev_head_in_w2 = np.zeros(3)
+        self.prev_dist_to_head = 0
+        self.prev_gaze_velocities = np.zeros(3)
+        
+        self.state = RobotState.START
+        self.speed = 0.05
+        self.speed_multiplier = 0.5
+        
+        self.movement_stop_threshold = 0.007
+
+        self.t_refresh_rate = 0.06 # not a rate but a period # 0.1 or 0.02 probably best
+        self.t_refresh_threshold = self.t_refresh_rate
+                                        
+        # Sanity check at the end of node. If both of these are printed, then the node is probably working properly.
+        self.get_logger().info('present time.')  
+    
+    def get_gaze_velocities(self, breathing_task):
+        
+        try:
+            cw1 = 0
+            cw2 = 0                
+            
+            tf = self.tfBuffer.lookup_transform(self.world, self.tf_name, rclpy.time.Time())        
+            tf_matrix = np.eye(4)
+            tf_matrix[0:3, 0:3] = R.from_quat([tf.transform.rotation.x,
+                                                tf.transform.rotation.y,
+                                                tf.transform.rotation.z,
+                                                tf.transform.rotation.w]).as_matrix()
+            tf_matrix[0:3, 3] = np.array([tf.transform.translation.x,
+                                        tf.transform.translation.y,
+                                        tf.transform.translation.z])        
+            ee = self.get_current_coordinate()
+            ee = self.base_to_world_homogeneous @ np.concatenate((ee, [1]))
+            pos = np.array([tf.transform.translation.x - ee[0], tf.transform.translation.y - ee[1], tf.transform.translation.z - ee[2]])
+            dist_to_head = np.linalg.norm(pos)
+            dist_to_head = dist_to_head * 0.1 + self.prev_dist_to_head * 0.9
+            self.prev_dist_to_head = dist_to_head
+            self.gaze_multiplier = (2.5445)*dist_to_head + 1.8168
+            self.gaze_multiplier *= self.breathe_frequency*2
+
+            instant_velocities = breathing_task
+            delta = instant_velocities[:3]
+            #delta *= 0 # Comment this line to enable gazing
+                    
+            gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
+            try:
+                
+                base_to_w1_rot = base_to_wrist1_rotation(self.joint_states_global["pos"])
+                delta_in_w1 = base_to_w1_rot.T @ delta    
+                
+                base_to_head = self.world_to_base_homogeneous @ tf_matrix
+                
+                w1_to_base = wrist1_to_base_transformation(self.joint_states_global["pos"])            
+                head_in_w1 = w1_to_base @ base_to_head
+                head_in_w1_pos = np.array([head_in_w1[0, 3], head_in_w1[1, 3]-delta_in_w1[1], 0])
+                
+                w2_to_base = wrist2_to_base_transformation(self.joint_states_global["pos"])
+                head_in_w2 = w2_to_base @ base_to_head
+                head_in_w2_pos = np.array([head_in_w2[0, 3], head_in_w2[1, 3], 0])
+                
+                head_in_w1_norm = np.linalg.norm(head_in_w1_pos)
+                cw1 = np.arccos(0.0997 / head_in_w1_norm) - np.arccos(np.dot([0,-1,0], head_in_w1_pos/head_in_w1_norm))
+                cw1 = cw1*(-1) if head_in_w1_pos[0] > 0 else cw1
+                cw1 = angular_wrap(cw1)
+                gazing_velocities[0] = cw1*self.gaze_multiplier
+                
+                head_in_w2_norm = np.linalg.norm(head_in_w2_pos)
+                cw2 = np.arccos(np.dot([0,1,0], head_in_w2_pos/head_in_w2_norm))
+                cw2 = cw2*(-1) if head_in_w2_pos[0] > 0 else cw2
+                cw2 = angular_wrap(cw2)
+                gazing_velocities[1] = cw2*self.gaze_multiplier
+                    
+            except Exception as e:
+                gazing_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
+                print("Error in getting head position: ", traceback.format_exc())
+            finally:
+                gazing_velocities = gazing_velocities * 0.1 + self.prev_gaze_velocities * 0.9
+                self.prev_gaze_velocities = gazing_velocities
+                gaze_velocities_arr.append(gazing_velocities)
+                return gazing_velocities
+        except Exception as e:
+            print("Error in getting gaze velocities: ", traceback.format_exc())
+            return np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
+
+    def get_current_coordinate(self):
+        current_coordinate = np.zeros(3)        
+        try:
+            current_coordinate = get_ee_position(self.joint_states_global["pos"])
+        except:
+            print("Error in getting current coordinate: ", traceback.format_exc())
+        return current_coordinate
+       
+    def get_joint_pos(self):
+        return self.joint_states_global["pos"]
+    
+    def go_to_joint_pos(self, desired_joint_positions, speed=0.05):
+        
+        trajectory = desired_joint_positions - self.joint_states_global["pos"]      
+        norm = np.linalg.norm(desired_joint_positions - self.joint_states_global["pos"])        
+        delta_t = norm/speed
+                
+        velocity_command = trajectory / delta_t
+        print("desired_joint_positions: ", desired_joint_positions)
+        print("velocity_command: ", velocity_command)
+            
+        self.publishVelocityCommand(velocity_command)
+        
+        start_time = time.time()
+        
+        while norm > 0.0005 and time.time() - start_time < delta_t + 0.1:
+            norm = np.linalg.norm(desired_joint_positions - self.joint_states_global["pos"])
+            
+        self.stop_movement() 
+        
+        print("Position reached, current position: ", self.joint_states_global["pos"])  
+  
+    def go_to_pose_in_base(self, desired_coordinate, desired_orientation=None, speed=0.05):       
+        
+        current_coordinate = self.get_current_coordinate()
+        
+        max_error = 0.001
+        
+        dist = np.linalg.norm(desired_coordinate - current_coordinate)
+        slowdown_dist = dist*0.2
+        
+        if np.linalg.norm(desired_coordinate - current_coordinate) < max_error:
+            self.stop_movement()
+            print("Already at the desired position.")
+            return
+                                 
+        print("Current position: ", current_coordinate)   
+        print("Going to point: ", desired_coordinate)
+        
+        est_time = np.linalg.norm(desired_coordinate - current_coordinate) / speed
+        
+        if desired_orientation is not None:
+            rot_speed = np.linalg.norm(desired_orientation)/est_time            
+            desired_rot_speed_in_base = (desired_orientation / np.linalg.norm(desired_orientation)) * rot_speed 
+            desired_orientation = desired_orientation / np.linalg.norm(desired_orientation)          
+            print("Desired Rot Speed: ", desired_rot_speed_in_base)
+        else:
+            print("No desired orientation, keeping current orientation.")
+            desired_rot_speed_in_base = np.zeros(3)
+                    
+        start_time = time.time()                
+        min_speed = 0.05
+        min_dist = 0.1
+        curr_speed = speed if dist > min_dist else 0.1
+        error = 99999
+        while rclpy.ok() and error > max_error:
+            if time.time() - start_time > est_time:
+                desired_rot_speed_in_base = np.zeros(3)
+            
+            current_coordinate = self.get_current_coordinate()
+            
+            if dist > min_dist and curr_speed > min_speed and error < slowdown_dist:
+                curr_speed -= 0.0001
+                print("Slowing down, current speed: ", curr_speed, "-", len(data))
+            
+            trajectory_desired_coordinate = desired_coordinate - current_coordinate
+            velocity_desired_coordinate = trajectory_desired_coordinate / np.linalg.norm(trajectory_desired_coordinate) * curr_speed 
+            
+            velocity_desired = np.concatenate((velocity_desired_coordinate, desired_rot_speed_in_base)) # May need to change from zeros to actual values while creating sphere
+            pinv_jacobian = self.get_inverse_jacobian()
+            velocity_command = pinv_jacobian @ velocity_desired     
+                                
+            self.publishVelocityCommand(velocity_command) 
+            
+            self.ros_rate.sleep()  
+            current_coordinate = self.get_current_coordinate()
+            tmp_error = np.linalg.norm(desired_coordinate - current_coordinate)
+            if tmp_error < slowdown_dist and tmp_error - error > 0.0001:
+                print("Error in position, breaking.", np.linalg.norm(desired_coordinate - current_coordinate), "-", error)
+                break
+            error = np.linalg.norm(desired_coordinate - current_coordinate)
+                        
+        self.stop_movement()        
+        print("Position reached, current position: ", current_coordinate)
+   
+    def visulalize_trajectory(self):
+        #print("Visualizing trajectory.")
+        id = 0        
+        points = np.linspace(0, 1, 100)
+        traj_points = MarkerArray()
+        for pt in points:
+            
+            marker = Marker()
+            marker.header.frame_id = self.base
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = "trajectory"
+            marker.id = id
+            marker.type = marker.SPHERE
+            marker.action = marker.ADD
+            marker.pose.position.x = self.x_coordinate(pt)
+            marker.pose.position.y = self.y_coordinate(pt)
+            marker.pose.position.z = self.z_coordinate(pt)
+            marker.pose.orientation.x = 0.0
+            marker.pose.orientation.y = 0.0
+            marker.pose.orientation.z = 0.0
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.01
+            marker.scale.y = 0.01
+            marker.scale.z = 0.01
+            marker.color.r = 1.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            marker.color.a = 1.0
+                            
+            traj_points.markers.append(marker)
+            
+            id += 1
+        #print("Trajectory points: ", len(traj_points.markers))
+        self.traj_publisher.publish(traj_points)    
+        #print("Trajectory published.")
+  
+    def set_pick_up_cubic_variables(self, object_position, desired_pose, raise_eff=True):
+        print("Setting up cubic pick up variables.")
+        
+        try:     
+            already_picked_up.append(object_position)
+                   
+            object_position = self.base_to_world_homogeneous @ np.concatenate((object_position, [1]))
+            object_position = object_position[:3]
+        
+            object_position[1] += 0.015
+            
+            object_position = self.world_to_base_homogeneous @ np.concatenate((object_position, [1]))
+            object_position = object_position[:3]
+            
+            object_position[2] += self.gripper_length + 0.02
+            
+            self.gripper.open_async()
+            
+            eef_to_desired = self.tfBuffer.lookup_transform(self.eef, desired_pose, rclpy.time.Time())
+            rotvec = R.from_quat([eef_to_desired.transform.rotation.x,
+                                    eef_to_desired.transform.rotation.y,
+                                    eef_to_desired.transform.rotation.z,
+                                    eef_to_desired.transform.rotation.w]).as_rotvec()
+            
+            pick_to_base = self.tfBuffer.lookup_transform(self.base, self.eef, rclpy.time.Time())
+            rotvec = R.from_quat([pick_to_base.transform.rotation.x,
+                                                        pick_to_base.transform.rotation.y,
+                                                        pick_to_base.transform.rotation.z,
+                                                        pick_to_base.transform.rotation.w]).apply(rotvec)
+                                    
+            start_point = self.get_current_coordinate()
+            mid1_point = object_position + np.array([0, 0, 0.1])
+            if raise_eff:
+                mid0_point = start_point + np.array([0, 0, 0.2])
+            else:
+                mid0_point = mid1_point
+            end_point = object_position - np.array([0, 0, 0.05])
+            x_coeff, y_coeff, z_coeff = three_point_cubic_spline(start_pos=start_point, mid0_pos=mid0_point, mid1_pos=mid1_point, end_pos=end_point)
+            self.end_pos = end_point
+            print("Destination: ", end_point)
+       
+            self.x_coordinate = lambda t: x_coeff[0]*t**3 + x_coeff[1]*t**2 + x_coeff[2]*t + x_coeff[3]
+            self.y_coordinate = lambda t: y_coeff[0]*t**3 + y_coeff[1]*t**2 + y_coeff[2]*t + y_coeff[3]
+            self.z_coordinate = lambda t: z_coeff[0]*t**3 + z_coeff[1]*t**2 + z_coeff[2]*t + z_coeff[3]
+            
+            self.visulalize_trajectory()
+            
+            length_local = 0
+            prev_point = np.array([self.x_coordinate(0), self.y_coordinate(0), self.z_coordinate(0)])
+            i = 0
+            while i < 5000:
+                point = np.array([self.x_coordinate(i/5000), self.y_coordinate(i/5000), self.z_coordinate(i/5000)])
+                length_local += np.linalg.norm(point - prev_point)
+                prev_point = point      
+                i += 1          
+                        
+            est_time = length_local / self.speed
+            if rotvec is not None:
+                rot_speed = np.linalg.norm(rotvec)/(est_time)           
+                desired_rot_speed_local = (rotvec / np.linalg.norm(rotvec)) * rot_speed 
+                print("Desired Rot Speed: ", desired_rot_speed_local)
+            else:
+                print("No desired orientation, keeping current orientation.")
+                desired_rot_speed_local = np.zeros(3)
+                         
+            self.desired_rot_speed = desired_rot_speed_local
+                                    
+            self.length = length_local
+            
+            self.x_derivative = lambda t: 3*x_coeff[0]*t**2 + 2*x_coeff[1]*t + x_coeff[2]
+            self.y_derivative = lambda t: 3*y_coeff[0]*t**2 + 2*y_coeff[1]*t + y_coeff[2]
+            self.z_derivative = lambda t: 3*z_coeff[0]*t**2 + 2*z_coeff[1]*t + z_coeff[2]
+                            
+            self.t = 0
+            self.t_refresh_threshold = self.t_refresh_rate
+                        
+            return True
+                
+        except Exception as e:
+            print("Error in setting pick up object cubically:\n", traceback.format_exc())
+            self.stop_movement()
+            return False
+    
+    def get_all_markers(self):
+        
+        markers = []
+        
+        try:            
+            for i in range(100):
+                if self.tfBuffer.can_transform(self.world, f"marker_{i}", rclpy.time.Time(seconds=0)):
+                    object_tf = self.tfBuffer.lookup_transform(self.world, f"marker_{i}", rclpy.time.Time(seconds=0))
+                    object_position = np.array([object_tf.transform.translation.x, object_tf.transform.translation.y, object_tf.transform.translation.z])
+                    markers.append(object_position)                    
+        except Exception as e:
+            print("Error in getting all markers:", traceback.format_exc())
+            return markers
+        return markers
+    
+    def get_placement_position(self): # in world frame
+        
+        try:
+            markers = self.get_all_markers()
+            
+            for dock in PLACEMENT_AREA:
+                clear = True
+                for marker in markers:
+                    marker = marker[:2]
+                    #print("Marker test: ", marker, " - ", dock)
+                    if np.linalg.norm(marker - dock) < 0.05:
+                        clear = False
+                        #print("Marker is too close to the dock: ", marker, " - ", dock)
+                        break
+                
+                if clear:
+                    return dock
+            print("No clear placement position found.")
+            return None
+        except Exception as e:
+            print("Error in getting placement position:", traceback.format_exc())
+            return None
+    
+    def set_place_cubic_variables(self):
+        
+        try:
+                        
+            start_point = self.get_current_coordinate()
+            
+            end_point = self.get_placement_position()
+            if end_point is None:
+                print("No clear placement position found.")
+                return False
+            
+            start_point_z_in_world = self.base_to_world_homogeneous @ np.concatenate((start_point, [1]))
+            start_point_z_in_world = start_point_z_in_world[2]
+            end_point = np.array([end_point[0], end_point[1], start_point_z_in_world - 0.005])
+            end_point = self.world_to_base_homogeneous @ np.concatenate((end_point, [1]))
+            end_point = end_point[:3]     
+            
+            mid0_point = start_point + np.array([0, 0, 0.2])
+            mid1_point = end_point + np.array([0, 0, 0.2])
+            x_coeff, y_coeff, z_coeff = three_point_cubic_spline(start_pos=start_point, mid0_pos=mid0_point, mid1_pos=mid1_point, end_pos=end_point)  
+            self.end_pos = end_point                       
+            
+            self.x_coordinate = lambda t: x_coeff[0]*t**3 + x_coeff[1]*t**2 + x_coeff[2]*t + x_coeff[3]
+            self.y_coordinate = lambda t: y_coeff[0]*t**3 + y_coeff[1]*t**2 + y_coeff[2]*t + y_coeff[3]
+            self.z_coordinate = lambda t: z_coeff[0]*t**3 + z_coeff[1]*t**2 + z_coeff[2]*t + z_coeff[3]
+            
+            self.visulalize_trajectory()
+            
+            length_local = 0
+            prev_point = np.array([self.x_coordinate(0), self.y_coordinate(0), self.z_coordinate(0)])
+            i = 0
+            while i < 5000:
+                point = np.array([self.x_coordinate(i/5000), self.y_coordinate(i/5000), self.z_coordinate(i/5000)])
+                length_local += np.linalg.norm(point - prev_point)
+                prev_point = point  
+                i += 1              
+            
+            self.desired_rot_speed = np.zeros(3)
+                                    
+            self.length = length_local
+            
+            self.x_derivative = lambda t: 3*x_coeff[0]*t**2 + 2*x_coeff[1]*t + x_coeff[2]
+            self.y_derivative = lambda t: 3*y_coeff[0]*t**2 + 2*y_coeff[1]*t + y_coeff[2]
+            self.z_derivative = lambda t: 3*z_coeff[0]*t**2 + 2*z_coeff[1]*t + z_coeff[2]
+                            
+            self.t = 0
+            self.t_refresh_threshold = self.t_refresh_rate
+                        
+            return True
+                
+        except Exception as e:
+            print("Error in picking up object cubically:", traceback.format_exc())
+            return False
+    
+    def set_breathing_gazing(self):
+        
+        try:
+            self.prev_gaze_velocities = np.zeros(self.num_of_total_joints - self.num_of_breathing_joints)
+            self.go_to_home_pos(self.speed) 
+            self.gripper.close_async()                          
+                    
+            head_in_w1 = self.tfBuffer.lookup_transform("wrist_1_link", self.tf_name, rclpy.time.Time(seconds=0))
+            head_in_w1_pos = np.array([head_in_w1.transform.translation.x, head_in_w1.transform.translation.y, 0])
+            self.prev_head_in_w1 = head_in_w1_pos
+                
+            head_in_w2 = self.tfBuffer.lookup_transform("wrist_2_link", self.tf_name, rclpy.time.Time(seconds=0))
+            head_in_w2_pos = np.array([head_in_w2.transform.translation.x, head_in_w2.transform.translation.y, 0])
+            self.prev_head_in_w2 = head_in_w2_pos
+            
+            self.breathing_start_time = time.time()
+            
+            self.breathe_controller.reset()
+        except Exception as e:
+            print("Error in setting breathing and gazing: ", traceback.format_exc())
+            self.stop_movement()
+    
+    def refresh_derivatives(self):
+        
+        start_point = self.get_current_coordinate()
+        end_point = np.array([self.x_coordinate(1), self.y_coordinate(1), self.z_coordinate(1)])
+        start_derivative = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
+        end_derivative = np.array([self.x_derivative(1), self.y_derivative(1), self.z_derivative(1)])
+        
+        output_vector_x = np.array([start_point[0], start_derivative[0], end_point[0], end_derivative[0]])
+        output_vector_y = np.array([start_point[1], start_derivative[1], end_point[1], end_derivative[1]])
+        output_vector_z = np.array([start_point[2], start_derivative[2], end_point[2], end_derivative[2]])
+        
+        current_values = np.zeros((4, 4))
+        current_values[0] = np.array([self.t**3, self.t**2, self.t, 1])
+        current_values[1] = np.array([3*self.t**2, 2*self.t, 1, 0])
+        current_values[2] = np.array([1, 1, 1, 1])
+        current_values[3] = np.array([3, 2, 1, 0])
+        
+        coeff_matrix = np.linalg.inv(current_values)
+        
+        x_coeff = coeff_matrix @ output_vector_x
+        y_coeff = coeff_matrix @ output_vector_y
+        z_coeff = coeff_matrix @ output_vector_z
+        
+        self.x_coordinate = lambda t: x_coeff[0]*t**3 + x_coeff[1]*t**2 + x_coeff[2]*t + x_coeff[3]
+        self.y_coordinate = lambda t: y_coeff[0]*t**3 + y_coeff[1]*t**2 + y_coeff[2]*t + y_coeff[3]
+        self.z_coordinate = lambda t: z_coeff[0]*t**3 + z_coeff[1]*t**2 + z_coeff[2]*t + z_coeff[3]
+        
+        self.visulalize_trajectory()
+        
+        #x_coeff, y_coeff, z_coeff = three_point_cubic_spline(start_pos=start_point, start_derivative=start_derivative, end_derivative=end_derivative, end_pos=end_point)
+        
+        self.x_derivative = lambda t: 3*x_coeff[0]*t**2 + 2*x_coeff[1]*t + x_coeff[2]
+        self.y_derivative = lambda t: 3*y_coeff[0]*t**2 + 2*y_coeff[1]*t + y_coeff[2]
+        self.z_derivative = lambda t: 3*z_coeff[0]*t**2 + 2*z_coeff[1]*t + z_coeff[2]
+    
+    def get_derivative_velocities(self):
+                    
+        #refresh derivatives every 0.1 t to avoid over/undershooting
+        if self.t < 0.95 and self.t > self.t_refresh_threshold:
+            print("Refreshing derivatives.")
+            self.refresh_derivatives()
+            self.t_refresh_threshold += self.t_refresh_rate 
+                                        
+        trajectory_desired = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
+        desired_linear_speed = (trajectory_desired / np.linalg.norm(trajectory_desired)) * self.speed
+        desired_speed = np.concatenate((desired_linear_speed, self.desired_rot_speed))
+        desired_speed *= self.speed_multiplier
+        
+        pinv_jacobian = self.get_inverse_jacobian()
+        velocity_command = pinv_jacobian @ desired_speed
+        
+        self.t += (self.speed * self.speed_multiplier) / (self.length * self.control_rate)            
+        
+        return velocity_command
+            
+    def go_to_home_pos(self, speed=0.05):
+        self.go_to_joint_pos(self.home_pos, speed=speed)
+        
+    def stop_movement(self):
+        vel_msg = Float64MultiArray()
+        vel_msg.data = np.array([0, 0, 0, 0, 0, 0])
+        self.velocityControllerPub.publish(vel_msg)
+        self.vel_comm_ind = 0
+        print("Movement stopped.")
+          
+    def get_jacobian_matrix(self):
+        # get_jacobian is a function that returns the jacobian matrix of the robot at the current joint states, it was calculated using matlab.
+        jacobian = get_jacobian(self.joint_states_global["pos"].tolist())
+        return jacobian
+                        
+    def get_inverse_jacobian(self):
+        # get_jacobian is a function that returns the jacobian matrix of the robot at the current joint states, it was calculated using matlab.
+        jacobian = get_jacobian(self.joint_states_global["pos"].tolist())
+        invj = np.linalg.pinv(jacobian, rcond=1e-15)
+        return invj
+        
+    def filter_joint_velocities(self, joint_velocities):
+        
+        if self.vel_comm_ind == 0:
+            self.prev_velocities = joint_velocities
+            self.vel_comm_ind = 1
+            return joint_velocities
+                
+        max_speed_diffs = np.array([0.0035, 0.0035, 0.0035, 0.0035, 0.0035, 0.0035])
+        critical_speed_diffs = np.array([0.007, 0.007, 0.007, 0.007, 0.007, 0.007])
+        
+        filter_weight = 0.9
+                
+        for j in range(self.num_of_total_joints):
+            change = joint_velocities[j] - self.prev_velocities[j]
+            if abs(change) > max_speed_diffs[j]:
+                joint_velocities[j] = self.prev_velocities[j]*filter_weight + joint_velocities[j]*(1-filter_weight)
+                #joint_velocities[j] = self.prev_velocities[j] + np.sign(change) * max_speed_diffs[j]
+                if abs(joint_velocities[j] - self.prev_velocities[j]) > critical_speed_diffs[j]:
+                    joint_velocities[j] = self.prev_velocities[j] + np.sign(change) * critical_speed_diffs[j] 
+        
+        self.prev_velocities = joint_velocities
+        
+        return joint_velocities
+    
+    def publishVelocityCommand(self, vels):
+        if type(vels) is not np.ndarray:
+            vels = np.array(vels)
+         
+        vels = self.filter_joint_velocities(vels)      
+        
+        data.append(self.joint_states_global["vels"])
+        data_c.append(vels)
+            
+        vel_msg = Float64MultiArray()
+        vel_msg.data = vels
+        self.velocityControllerPub.publish(vel_msg)
+        
+    def joint_state_callback(self, msg):
+        # Why does UR5e always send joint states in an order other than 012345? It was 210345 in ROS1 and now this.
+        self.joint_states_global["pos"] = np.array([
+                                            msg.position[5],
+                                            msg.position[0],
+                                            msg.position[1],
+                                            msg.position[2],
+                                            msg.position[3],
+                                            msg.position[4]])
+        self.joint_states_global["vels"] = np.array([
+                                            msg.velocity[5],
+                                            msg.velocity[0],
+                                            msg.velocity[1],
+                                            msg.velocity[2],
+                                            msg.velocity[3],
+                                            msg.velocity[4]])
+        self.joint_states_global["effs"] = np.array([
+                                            msg.effort[5],
+                                            msg.effort[0],
+                                            msg.effort[1],
+                                            msg.effort[2],
+                                            msg.effort[3],
+                                            msg.effort[4]])         
+     
+    def object_to_pick_up(self):
+
+        markers = self.get_all_markers()
+        #print(already_picked_up)
+
+        try: 
+            for marker in markers:
+                already = False
+                object_position = marker
+                #print(f"Object position for marker: ", object_position)
+                if is_in_pick_up_area(object_position):
+                    object_position = self.world_to_base_homogeneous @ np.concatenate((object_position, [1]))
+                    object_position = object_position[:3]
+                    for obj_pos in already_picked_up:
+                        if object_position[0] == obj_pos[0] and object_position[1] == obj_pos[1]:
+                            #print("Already picked up object: ", object_position)
+                            already = True
+                            break
+                    if already:
+                        continue
+                    #print("Object to pick up: ", object_position)
+                    return object_position
+        except Exception as e:
+            print("Error in getting object to pick up:", traceback.format_exc())
+            return None
+        print("No object to pick up.")
+        return None
+        
+    def publish_arrow(self, start_pos, end_pos):
+        # Publish an arrow from start_pos to curr_target
+        arrow_marker = Marker()
+        arrow_marker.header.frame_id = self.base
+        arrow_marker.header.stamp = self.get_clock().now().to_msg()
+        arrow_marker.ns = "arrow"
+        arrow_marker.id = 0
+        arrow_marker.type = Marker.ARROW
+        arrow_marker.action = Marker.ADD
+        arrow_marker.scale.x = 0.02  # Arrow shaft diameter
+        arrow_marker.scale.y = 0.04  # Arrow head diameter
+        arrow_marker.scale.z = 0.04  # Arrow head length
+        arrow_marker.color.r = 1.0
+        arrow_marker.color.g = 0.0
+        arrow_marker.color.b = 0.0
+        arrow_marker.color.a = 1.0
+
+        # Set the arrow start and end points
+        arrow_marker.points = [
+            Point(x=start_pos[0], y=start_pos[1], z=start_pos[2]),
+            Point(x=end_pos[0], y=end_pos[1], z=end_pos[2]),
+        ]
+
+        # Publish the arrow marker
+        self.delta_publisher.publish(arrow_marker)
+     
+    def create_publisher_for_gaze_test_horizontal_movement(self):
+        """
+        Creates a publisher for the gaze test horizontal movement.
+        """
+        self.gaze_test_horizontal_movement_pub = self.create_publisher(Bool, "gaze_test_horizontal_movement_start_recording", 10)
+        
+    def publish_to_start_recording_for_gaze_test_horizontal_movement(self):
+        """
+        Creates a publisher for the gaze test horizontal movement.
+        """
+        self.gaze_test_horizontal_movement_pub.publish(Bool(data=True))
+                
+    def gaze_test_horizontal_movement(self,
+                                    radius: float,
+                                    period: float,
+                                    direction: np.ndarray,
+                                    duration: float = -1.0):
+        """
+        Pure feed‑forward horizontal oscillation:
+            center → left → center → right → center
+        One full cycle lasts `period` seconds.
+
+        Uses the same 10‑%↔100‑% easing profile, but pre‑scales the nominal
+        speed so that the area under the velocity curve matches the requested
+        displacement exactly (eliminates net drift).
+
+        :param radius:   maximum displacement from centre (metres)
+        :param period:   time for one full 4‑segment cycle (seconds)
+        :param direction: 3‑vector axis along which to move
+        :param duration: total run time (seconds), ‑1 for infinite
+        """
+        # ---- constants -------------------------------------------------------
+        EASE_AREA = 0.775  # ∫ multiplier dt over [0,1] with your profile
+
+        axis   = direction / np.linalg.norm(direction)
+        seg_t  = period / 4.0
+        segments = [
+            ( 0.0,  -radius),   # centre → left
+            (-radius, 0.0),     # left   → centre
+            ( 0.0,   radius),   # centre → right
+            ( radius, 0.0),     # right  → centre
+        ]
+
+        t_start = time.time()
+        stop = False
+
+        while not stop:
+            for start_off, end_off in segments:
+                dist   = end_off - start_off
+                speed  = abs(dist) / (seg_t * EASE_AREA)  # *** corrected ***
+                velvec = axis * np.sign(dist) * speed
+                cmd6   = np.concatenate((velvec, np.zeros(3)))
+
+                t0 = time.time()
+                while time.time() - t0 < seg_t:
+                    if duration > 0 and (time.time() - t_start) >= duration:
+                        stop = True
+                        break
+
+                    p = (time.time() - t0) / seg_t  # 0–1
+
+                    # easing profile
+                    if p < 0.25:
+                        mult = 0.1 + 0.9 * (p * 4)
+                    elif p > 0.75:
+                        mult = 0.1 + 0.9 * ((1 - p) * 4)
+                    else:
+                        mult = 1.0
+
+                    twist = self.get_inverse_jacobian() @ (mult * cmd6)
+                    self.publishVelocityCommand(twist)
+                    self.ros_rate.sleep()
+
+                self.stop_movement()
+                if stop:
+                    break
+
+    def create_publisher_to_start_recording_for_gaze_test_circular_movement(self):
+        """
+        Creates a publisher for the gaze test circular movement.
+        """
+        self.gaze_test_circular_movement_start_recording_pub = self.create_publisher(Bool, "gaze_test_circular_movement_start_recording", 10)
+        
+    def publish_to_start_recording_for_gaze_test_circular_movement(self, start):
+        """
+        Creates a publisher for the gaze test circular movement. if parameter start is true, it will publish true to start the recording, otherwise publish false to end the recording.
+        """
+        self.gaze_test_circular_movement_start_recording_pub.publish(Bool(data=bool(start)))
+
+    def create_sub_to_start_gaze_test_circular_movement(self):
+        self.gaze_test_circular_movement_sub = self.create_subscription(
+            Bool,
+            "gaze_test_start_circular_movement",
+            self.circular_movement_callback,
+            10
+        )
+
+    def circular_movement_callback(self, msg):
+        self.circular_movement_triggered.set()
+        self.should_continue_circular_movement_loop = bool(msg.data)
+        
+    def gaze_test_play_recording_started_sound(self):
+        playsound('/usr/share/sounds/freedesktop/stereo/complete.oga')  # or any short WAV/MP3 file
+
+    def gaze_test_circular_movement(self, radius, period, duration, arc_angle_deg, gaze_target_tracker, camera_tracker):
+        """
+        Circular movement of the gaze.
+        :param radius: radius of the circular movement
+        :param period: period of the circular movement
+        :param duration: duration of the circular movement
+        :param arc_angle_deg: angle in degrees for the arc
+        """
+        if (self.gaze_test_circular_movement_ongoing):
+            print("Gaze test circular movement is already ongoing.")
+            return
+        self.gaze_test_circular_movement_ongoing = True
+        while not self.tfBuffer.can_transform(self.base, gaze_target_tracker, rclpy.time.Time(seconds=0)):
+            print("Waiting for transform from base to gaze target...")
+            time.sleep(0.1)
+        
+        deg_to_rad = arc_angle_deg * (np.pi / 180)
+        print("Arc angle in radians: ", deg_to_rad)
+        
+        rot_speed = deg_to_rad / period  # radians per second
+        
+        ang_0 = deg_to_rad/2 + np.pi/2 + np.pi/4 # + np.pi/4 is because the robots base has a 45degree offset
+        angle = lambda t: -(rot_speed * (t)) + ang_0
+        
+        # we will check whether gaze_target is in front of the robot as it should be, because sometimes an unknown error causes the robot to look behind (probably due to the tf tree)
+        transform_correct = False
+        print("Waiting to transform gaze_target correctly: ")
+        while not transform_correct:
+            try:
+                gaze_target_tf = self.tfBuffer.lookup_transform("world", gaze_target_tracker, rclpy.time.Time(seconds=0)).transform
+                base_tf = self.tfBuffer.lookup_transform("world", self.base, rclpy.time.Time(seconds=0)).transform
+                if (gaze_target_tf.translation.x - base_tf.translation.x < 0.0):
+                    transform_correct = True
+            except Exception as e:
+                time.sleep(0.1)
+            
+        eye_tf = self.tfBuffer.lookup_transform(self.base, gaze_target_tracker, rclpy.time.Time(seconds=0)).transform
+                
+        center_x = eye_tf.translation.x
+        center_y = eye_tf.translation.y
+        center_z = eye_tf.translation.z
+                
+        print("Center: ", center_x, center_y, center_z)
+                
+        x_position = lambda ang: radius * np.cos(ang) + center_x
+        y_position = lambda ang: radius * np.sin(ang) + center_y
+        z_position = lambda ang: center_z - 0.08
+
+        x_derivative = lambda ang: radius * np.sin(ang) * rot_speed
+        y_derivative = lambda ang: -radius * np.cos(ang) * rot_speed
+        z_derivative = lambda ang: 0.0
+        
+        # VISUALIZATION
+        #------------------------------------------------------------------------------------------------------------
+        id = 0        
+        points = np.linspace(ang_0, angle(period), 100)
+        traj_points = MarkerArray()
+        for pt in points:
+            
+            marker = Marker()
+            marker.header.frame_id = self.base
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = "trajectory"
+            marker.id = id
+            marker.type = marker.SPHERE
+            marker.action = marker.ADD
+            marker.pose.position.x = x_position(pt)
+            marker.pose.position.y = y_position(pt)
+            marker.pose.position.z = z_position(pt)
+            marker.pose.orientation.x = 0.0
+            marker.pose.orientation.y = 0.0
+            marker.pose.orientation.z = 0.0
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.01
+            marker.scale.y = 0.01
+            marker.scale.z = 0.01
+            marker.color.r = 1.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            marker.color.a = 1.0
+                            
+            traj_points.markers.append(marker)
+            
+            id += 1
+        
+        for pt in points:
+            
+            marker = Marker()
+            marker.header.frame_id = self.base
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = "trajectory_derivatives"
+            marker.id = id
+            marker.type = marker.ARROW
+            marker.action = marker.ADD
+            marker.scale.x = 0.01  # Arrow shaft diameter
+            marker.scale.y = 0.02  # Arrow head diameter
+            marker.scale.z = 0.02  # Arrow head length
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            marker.color.a = 1.0
+
+            # Set the arrow direction using derivatives
+            arrow_vector = np.array([x_derivative(pt), y_derivative(pt), z_derivative(pt)])
+            arrow_vector /= np.linalg.norm(arrow_vector)  # Normalize the vector
+            marker.points = [
+                Point(x=x_position(pt), y=y_position(pt), z=z_position(pt)),
+                Point(
+                    x=x_position(pt) + arrow_vector[0] * 0.1,
+                    y=y_position(pt) + arrow_vector[1] * 0.1,
+                    z=z_position(pt) + arrow_vector[2] * 0.1,
+                ),
+            ]
+
+            traj_points.markers.append(marker)
+            
+            id += 1
+        self.traj_publisher.publish(traj_points)    
+        #------------------------------------------------------------------------------------------------------------
+        
+        #BELOW PART SERVES AS ITS OWN DOCUMENTATION FOR THE ROTATION LOGIC IN INVERSE JACOBIAN CONTROL
+        #------------------------------------------------------------------------------------------------------------- 
+        start_pos = np.array([x_position(ang_0), y_position(ang_0), z_position(ang_0)])
+        
+        target_tf = self.tfBuffer.lookup_transform(self.base, gaze_target_tracker, rclpy.time.Time(seconds=0))
+        curr_target = np.array([target_tf.transform.translation.x, target_tf.transform.translation.y, target_tf.transform.translation.z - 0.08])
+        print("Curr Target:", curr_target)
+        
+        self.publish_arrow(start_pos, curr_target)
+               
+        desired_z = curr_target - start_pos
+        desired_z /= np.linalg.norm(desired_z)
+        desired_y = np.array([0, 0, 1])
+        desired_x = np.cross(desired_y, desired_z)
+        desired_x /= np.linalg.norm(desired_x)
+        desired_y = np.cross(desired_z, desired_x)
+        desired_y /= np.linalg.norm(desired_y)
+        rot_matrix = np.array([desired_x, desired_y, desired_z]).T # desired end rotation in base
+        
+        base_to_eef = self.tfBuffer.lookup_transform(self.eef, self.base, rclpy.time.Time(seconds=0))
+        base_to_eef_matrix = R.from_quat([base_to_eef.transform.rotation.x,
+                                base_to_eef.transform.rotation.y,
+                                base_to_eef.transform.rotation.z,
+                                base_to_eef.transform.rotation.w]).as_matrix()
+        
+        rot_matrix = base_to_eef_matrix @ rot_matrix
+        rotvec = R.from_matrix(rot_matrix).as_rotvec()
+        
+        eef_to_base = self.tfBuffer.lookup_transform(self.base, self.eef, rclpy.time.Time(seconds=0))
+        rotvec = R.from_quat([eef_to_base.transform.rotation.x,
+                                eef_to_base.transform.rotation.y,
+                                eef_to_base.transform.rotation.z,
+                                eef_to_base.transform.rotation.w]).apply(rotvec)
+        
+        print("Rotvec: ", rotvec)
+        #-------------------------------------------------------------------------------------------------------------
+        
+        self.go_to_pose_in_base(start_pos, desired_orientation=rotvec, speed=0.1)
+        
+        if gaze_config.get_play_sound_when_recording_starts():
+            self.gaze_test_play_recording_started_sound()
+        # we will only now publish the start recording message, because we need to be in the correct position first (which is at the start of the circular arc)
+        self.publish_to_start_recording_for_gaze_test_circular_movement(start=True)
+
+        start_time = time.time()
+        
+        
+        while time.time() - start_time < duration:
+            
+            curr_time = time.time() - start_time
+            reverse = (curr_time // period) % 2
+            sign = -reverse * 2 + 1
+            curr_angle = angle((curr_time % period)*sign + reverse*period)
+            
+            linear_velocity = np.array([x_derivative(curr_angle), y_derivative(curr_angle), z_derivative(curr_angle)]) * sign
+            
+            """curr_eef = self.get_current_coordinate()"""
+            curr_cam_tf = self.tfBuffer.lookup_transform(self.base, camera_tracker, rclpy.time.Time(seconds=0)).transform.translation
+            curr_cam = np.array([curr_cam_tf.x, curr_cam_tf.y, curr_cam_tf.z])
+                           
+            target_tf = self.tfBuffer.lookup_transform(self.base, gaze_target_tracker, rclpy.time.Time(seconds=0))
+            curr_target = np.array([target_tf.transform.translation.x, target_tf.transform.translation.y, target_tf.transform.translation.z])
+                            
+            desired_z = curr_target - curr_cam
+            desired_z /= np.linalg.norm(desired_z)
+            desired_y = np.array([0, 0, 1])
+            desired_x = np.cross(desired_y, desired_z)
+            desired_x /= np.linalg.norm(desired_x)
+            desired_y = np.cross(desired_z, desired_x)
+            desired_y /= np.linalg.norm(desired_y)
+            rot_matrix = np.array([desired_x, desired_y, desired_z]).T # desired end rotation in base
+            
+            base_to_eef = self.tfBuffer.lookup_transform(self.eef, self.base, rclpy.time.Time(seconds=0))
+            base_to_eef_matrix = R.from_quat([base_to_eef.transform.rotation.x,
+                                    base_to_eef.transform.rotation.y,
+                                    base_to_eef.transform.rotation.z,
+                                    base_to_eef.transform.rotation.w]).as_matrix()
+            
+            rot_matrix = base_to_eef_matrix @ rot_matrix
+            rotvec = R.from_matrix(rot_matrix).as_rotvec()
+            
+            eef_to_base = self.tfBuffer.lookup_transform(self.base, self.eef, rclpy.time.Time(seconds=0))
+            rotvec = R.from_quat([eef_to_base.transform.rotation.x,
+                                    eef_to_base.transform.rotation.y,
+                                    eef_to_base.transform.rotation.z,
+                                    eef_to_base.transform.rotation.w]).apply(rotvec)            
+            rotvec *= 2
+                                          
+            self.publish_arrow(curr_cam, curr_target)
+            
+            desired_velocity = np.concatenate((linear_velocity, rotvec))
+            
+            pinv_jacobian = self.get_inverse_jacobian()
+            velocity_command = pinv_jacobian @ desired_velocity
+            
+            self.publishVelocityCommand(velocity_command)
+            self.ros_rate.sleep()
+            
+        # we will publish to stop the recording on data_collector node.
+        self.publish_to_start_recording_for_gaze_test_circular_movement(start=False)
+        self.stop_movement()
+        self.gaze_test_circular_movement_ongoing = False
+            
+    def gaze_test_circular_movement_complete(self):
+        if (self.gaze_test_circular_movement_ongoing):
+            print("Gaze test circular movement is already ongoing.")
+            return
+        print("Starting circular movement.")
+        try:
+            filename = gaze_config.get_joint_pos_path_for_center()
+            try:
+                initial_joint_pos = gaze_load_joint_pos(filename)
+            except Exception:
+                print(f"Error loading joint position file: {filename} : ", traceback.format_exc())
+                sys.exit(1)
+            try:
+                self.go_to_joint_pos(initial_joint_pos, speed=0.3)
+                self.stop_movement()
+            except Exception as e:    
+                print("Error in gaze_test_circular_movement_complete in going to joint position: ", traceback.format_exc())
+
+            # Run circular movement
+            self.gaze_test_circular_movement(
+                radius = self.get_gaze_test_circular_movement_config("radius"),
+                period = self.get_gaze_test_circular_movement_config("period"),
+                duration = self.get_gaze_test_circular_movement_config("duration"),
+                arc_angle_deg = self.get_gaze_test_circular_movement_config("arc_angle_deg"),
+                gaze_target_tracker = self.get_gaze_test_circular_movement_config("gaze_target_tracker"),
+                camera_tracker = self.get_gaze_test_circular_movement_config("camera_tracker")
+            )
+            self.stop_movement()
+            # Return to initial joint position
+            self.go_to_joint_pos(initial_joint_pos, speed=0.3)
+            self.stop_movement()
+        except Exception as e:
+            print("Error in gaze_test_circular_movement_complete: ", traceback.format_exc())
+
+        print("Finished circular movement.")
+
+            
+GAZE_JOINT_POS_DIR = gaze_config.get_joint_pos_dir()
+
+def gaze_save_joint_pos(joint_pos, filename):
+    """
+    Saves the joint position as a .npy file.
+    """
+    os.makedirs(GAZE_JOINT_POS_DIR, exist_ok=True)
+    if not filename.endswith(".npy"):
+        filename += ".npy"
+    path = os.path.join(GAZE_JOINT_POS_DIR, filename)
+    np.save(path, joint_pos)
+    print(f"Joint position saved to {path}")
+    
+def gaze_load_joint_pos(filename):
+    """
+    Loads joint position from .npy file.
+    """
+    if not filename.endswith(".npy"):
+        filename += ".npy"
+    path = os.path.join(GAZE_JOINT_POS_DIR, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Joint position file not found: {path}")
+    return np.load(path)
+
+def main_gaze_save_curr_joint_pos(args=None):
+    if len(sys.argv) < 2:
+        print("Usage: ros2 run robot_controller save_curr_joint_pos <filename>")
+        sys.exit(1)
+    filename = sys.argv[1]
+    
+    if type(filename) is not str:
+        raise TypeError("Filename must be a string.")
+
+    try:
+        rclpy.init(args=args)    
+        new_controller = NewController()
+
+        controller_spin_thread = threading.Thread(target=spin_thread, args=(new_controller,), daemon=True)
+        controller_spin_thread.start()
+        new_controller.speed = 0.3
+        
+        joint_pos = new_controller.get_joint_pos()
+        gaze_save_joint_pos(joint_pos, filename)
+    except Exception as e:    
+        print("Error in main_gaze_test: ", traceback.format_exc())   
+
+    try:
+        new_controller.stop_movement()
+                
+        new_controller.destroy_node()
+        rclpy.shutdown()
+    except:
+        print("Failed to stop node: ", traceback.format_exc())
+
+    controller_spin_thread.join()
+
+    print("Process finished.")
+
+def main_gaze_go_to_joint_pos(args=None):
+    """
+    Loads joint position from .npy file and sends command to go to that position.
+    """
+    if len(sys.argv) < 2:
+        print("Usage: ros2 run robot_controller go_to_joint_pos <filename>")
+        sys.exit(1)
+    filename = sys.argv[1]
+    
+    if type(filename) is not str:
+        raise TypeError("Filename must be a string.")
+
+    try:
+        joint_pos = gaze_load_joint_pos(filename)
+    except Exception:
+        print(f"Error loading joint position file: {filename} : ", traceback.format_exc())
+        sys.exit(1)
+    try:
+        rclpy.init(args=args)    
+        new_controller = NewController()
+
+        controller_spin_thread = threading.Thread(target=spin_thread, args=(new_controller,), daemon=True)
+        controller_spin_thread.start()
+        new_controller.speed = 0.3
+        new_controller.gripper.open() # open gripper so that it does not block camera view
+        new_controller.go_to_joint_pos(joint_pos, speed=0.3)
+
+    except Exception as e:    
+        print("Error in main_gaze_test: ", traceback.format_exc())   
+
+    try:
+        new_controller.stop_movement()
+                
+        new_controller.destroy_node()
+        rclpy.shutdown()
+    except:
+        print("Failed to stop node.")
+
+    controller_spin_thread.join()
+
+    print("Process finished.")
+
+def main_gaze_test_horizontal(args=None):
+    try:
+        rclpy.init(args=args)
+        new_controller = NewController()
+
+        controller_spin_thread = threading.Thread(
+            target=spin_thread, args=(new_controller,), daemon=True)
+        controller_spin_thread.start()
+        new_controller.speed = 0.3
+        new_controller.create_publisher_for_gaze_test_horizontal_movement()
+
+        print("Starting horizontal movement test.")
+        
+        filename = gaze_config.get_joint_pos_path_for_center()
+        try:
+            initial_joint_pos = gaze_load_joint_pos(filename)
+        except Exception:
+            print(f"Error loading joint position file: {filename} : ", traceback.format_exc())
+            sys.exit(1)
+        try:
+            new_controller.go_to_joint_pos(initial_joint_pos, speed=0.3)
+            new_controller.stop_movement()
+        except Exception as e:    
+            print("Error in main_gaze_test_horizontal in going to joint position: ", traceback.format_exc())
+
+        new_controller.gripper.open() # open gripper so that it does not block camera view
+        # save initial joint position so we can return to it later
+        initial_joint_pos = new_controller.get_joint_pos()
+        horizontal_config = gaze_config.get_horizontal_movement_config()
+
+        RADIUS = horizontal_config["radius"]
+        PERIOD = horizontal_config["period"]
+        DIRECTION = horizontal_config["direction"]
+        DURATION = horizontal_config["duration"]
+
+        # Run horizontal movement
+        new_controller.gaze_test_horizontal_movement(
+            radius=RADIUS,
+            period=PERIOD,
+            direction=DIRECTION,
+            duration=DURATION
+        )
+        
+        new_controller.stop_movement()
+        
+        new_controller.publish_to_start_recording_for_gaze_test_horizontal_movement()
+        
+        new_controller.gaze_test_horizontal_movement(
+            radius=RADIUS,
+            period=PERIOD,
+            direction=DIRECTION,
+            duration=DURATION
+        )
+                
+        new_controller.stop_movement()
+        
+        # Return to initial joint position
+        new_controller.go_to_joint_pos(initial_joint_pos, speed=0.1)
+
+    except Exception as e:
+        print("Error in main_gaze_test_horizontal_movement: ", traceback.format_exc())
+
+    try:
+        new_controller.stop_movement()
+        new_controller.destroy_node()
+        rclpy.shutdown()
+    except:
+        print("Failed to cleanly shut down node: ", traceback.format_exc())
+
+    controller_spin_thread.join()
+
+    print("\n take care of yourself \n")
+
+def main_gaze_test_circular(args=None):
+    try:
+        rclpy.init(args=args)
+        new_controller = NewController()
+        new_controller.speed = 0.3
+        new_controller.init_gaze_test_circular_movement()
+        controller_spin_thread = threading.Thread(target=spin_thread, args=(new_controller,),daemon=True)
+        controller_spin_thread.start()
+        new_controller.gripper.open() # open gripper so that it does not block camera view
+        while True: 
+            if not new_controller.should_continue_circular_movement_loop:
+                break
+            print("Waiting for circular movement trigger...")
+            new_controller.circular_movement_triggered.wait()
+            print("Trigger received.")
+            if not new_controller.should_continue_circular_movement_loop:
+                break
+            new_controller.gaze_test_circular_movement_complete()
+            new_controller.circular_movement_triggered.clear()#clear trigger so that it starts waiting for the next trigger
+    except Exception as e:
+        print("Error in main_gaze_test_circular: ", traceback.format_exc())
+
+    try:
+        new_controller.stop_movement()
+        new_controller.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    except:
+        print("Failed to cleanly shut down node: ", traceback.format_exc())
+
+    print("\n take care of yourself \n")
+
+def spin_thread(node):
+    
+    try:
+        rclpy.spin(node)
+    except Exception as e:
+        print("Error in spin_thread: ", traceback.format_exc())
+        pass
+
+    return
+
+def robot_state_machine(controller):
+    
+    velocity_command = np.zeros(controller.num_of_total_joints)
+    velocity_command_modifier = np.zeros(controller.num_of_total_joints)
+    
+    # Set flags for breathing and gazing
+    do_breathing = True
+    do_gazing = True
+            
+    inf_breathe = True
+    
+    controller.breathing_start_time = time.time()
+    
+    gaze_breathe_duration = 0
+    
+    freq_test_time = time.time()
+    
+    while rclpy.ok():
+        
+        freq_arr.append(1/(time.time() - freq_test_time))
+        freq_test_time = time.time()
+                    
+        if controller.state == RobotState.START:
+            
+            pose_diff = np.linalg.norm(controller.joint_states_global["pos"] - controller.home_pos)
+            print("Pose Diff: ", pose_diff)
+            if pose_diff > 0.1:
+                controller.go_to_home_pos(speed=controller.speed)
+            controller.set_breathing_gazing()
+            controller.state = RobotState.BREATHING_GAZING
+            continue
+            
+        elif controller.state == RobotState.BREATHING_GAZING:
+                            
+            breathing_velocities = np.zeros(controller.num_of_breathing_joints)
+            breathing_task = np.zeros(3)
+            if do_breathing:
+                breathing_velocities, breathing_task = controller.breathe_controller.step(controller.joint_states_global["pos"], controller.joint_states_global["vels"], get_jacobian)
+                            
+            gazing_velocities = np.zeros(controller.num_of_total_joints - controller.num_of_breathing_joints)
+            if do_gazing: 
+                gazing_velocities = controller.get_gaze_velocities(breathing_task) 
+                                            
+            velocity_command = np.concatenate((breathing_velocities, gazing_velocities))
+         
+            if not inf_breathe and time.time() - controller.breathing_start_time > gaze_breathe_duration:
+                controller.state = RobotState.PICKING
+                controller.stop_movement()
+                object_to_pick = controller.object_to_pick_up()
+                if object_to_pick is not None:
+                    if not controller.set_pick_up_cubic_variables(object_to_pick, "pick_pose", raise_eff=False):
+                        controller.state = RobotState.END
+                else:
+                    controller.state = RobotState.END
+                continue
+            
+        elif controller.state == RobotState.PICKING:
+            
+            if controller.t >= 0 and controller.t <= 1 and np.linalg.norm(controller.get_current_coordinate() - controller.end_pos) > controller.movement_stop_threshold and (controller.t < 0.9 or abs(controller.get_current_coordinate()[2] - controller.end_pos[2]) > controller.movement_stop_threshold):
+                velocity_command = controller.get_derivative_velocities()
+            elif controller.t < 0:
+                print("SOMETHING WENT EXTREMELY WRONG.")
+                controller.stop_movement()
+                controller.state = RobotState.END
+                continue
+            else:                
+                print("controller.t =", controller.t)
+                print("controller.movement_stop_threshold =", controller.movement_stop_threshold)
+                print("abs(controller.get_current_coordinate()[2] - controller.end_pos[2]) =", abs(controller.get_current_coordinate()[2] - controller.end_pos[2]))
+                controller.stop_movement()
+                controller.state = RobotState.PLACING
+                print("Picking done.")
+                print("Current coordinate: ", controller.get_current_coordinate())
+                print("End coordinate: ", controller.end_pos)
+                print("Current - end coordinate: ", np.linalg.norm(controller.get_current_coordinate() - controller.end_pos))
+                if not controller.set_place_cubic_variables():
+                    controller.state = RobotState.BREATHING_GAZING
+                controller.gripper.close()
+                continue
+            
+        elif controller.state == RobotState.PLACING:
+            
+            if controller.t >= 0 and controller.t <= 1 and np.linalg.norm(controller.get_current_coordinate() - controller.end_pos) > controller.movement_stop_threshold and (controller.t < 0.9 or abs(controller.get_current_coordinate()[2] - controller.end_pos[2]) > controller.movement_stop_threshold):
+                velocity_command = controller.get_derivative_velocities()
+            elif controller.t < 0:
+                print("SOMETHING WENT EXTREMELY WRONG.")
+                controller.stop_movement()
+                controller.state = RobotState.END
+                continue
+            else:
+                print("controller.t =", controller.t)
+                print("controller.movement_stop_threshold =", controller.movement_stop_threshold)
+                print("abs(controller.get_current_coordinate()[2] - controller.end_pos[2]) =", abs(controller.get_current_coordinate()[2] - controller.end_pos[2]))
+                controller.stop_movement()
+                print("Placing done.")
+                print("Current coordinate: ", controller.get_current_coordinate())
+                print("End coordinate: ", controller.end_pos)
+                print("Current - end coordinate: ", np.linalg.norm(controller.get_current_coordinate() - controller.end_pos))
+                controller.gripper.open()
+                
+                object_to_pick = controller.object_to_pick_up()
+                if object_to_pick is not None and controller.set_pick_up_cubic_variables(object_to_pick, "pick_pose", raise_eff=True):
+                    controller.state = RobotState.PICKING
+                else:                    
+                    controller.set_breathing_gazing()
+                    controller.state = RobotState.BREATHING_GAZING
+                    inf_breathe = True
+                    
+                continue
+            
+        elif controller.state == RobotState.END:
+            print("STATE = END")
+            controller.stop_movement()
+            break
+        
+        velocity_command += velocity_command_modifier
+        controller.publishVelocityCommand(velocity_command)
+            
+        controller.ros_rate.sleep()
+      
+    try:  
+        controller.stop_movement()
+        #controller.go_to_home_pos(speed=controller.speed)
+    except:
+        print("Error in stopping movement: ", traceback.format_exc())
+        pass
+  
+def observer(controller, min_distance=0.9, max_distance=1.9):
+    
+    min_multiplier=0.5
+    max_multiplier=1.25
+    
+    prev_multiplier=min_multiplier
+    
+    min_frequency=0.25
+    max_frequency=0.50
+    
+    prev_frequency=min_frequency
+    
+    distance = 0.0
+    prev_distance = distance
+        
+    try:
+        
+        while controller.tfBuffer.can_transform(controller.eef, controller.tf_name, rclpy.time.Time(seconds=0)) == False:
+            print("Waiting for transform...")
+            time.sleep(0.1)
+        
+        while rclpy.ok():
+            
+            tf = controller.tfBuffer.lookup_transform("x_towards_board", controller.tf_name, rclpy.time.Time(seconds=0))
+            distance = abs(tf.transform.translation.x)
+                        
+            if distance < min_distance:
+                speed_multiplier = min_multiplier
+                freq = min_frequency
+            elif distance > max_distance:
+                speed_multiplier = max_multiplier
+                freq = max_frequency
+            else:
+                speed_multiplier = ((distance - min_distance) / (max_distance - min_distance)) * (max_multiplier - min_multiplier) + min_multiplier
+                freq = ((distance - min_distance) / (max_distance - min_distance)) * (max_frequency - min_frequency) + min_frequency
+            
+            speed_multiplier = 0.9* prev_multiplier + 0.1 * speed_multiplier
+            freq = 0.9* prev_frequency + 0.1 * freq
+            distance = 0.9 * prev_distance + 0.1 * distance
+            
+            prev_multiplier = speed_multiplier
+            prev_frequency = freq
+            
+            controller.speed_multiplier = speed_multiplier
+            controller.breathe_controller.set_frequency(freq)
+            controller.breathe_frequency = freq
+                        
+            time.sleep(0.01) 
+    except Exception as e:
+        print("Error in observer: ", traceback.format_exc())
+        pass
+
+def main(args=None):
+
+    try:
+        rclpy.init(args=args)    
+        new_controller = NewController()
+        
+        controller_spin_thread = threading.Thread(target=spin_thread, args=(new_controller,))
+        controller_spin_thread.start()
+        
+        controller_observer_thread = threading.Thread(target=observer, args=(new_controller,))
+        controller_observer_thread.start()
+        
+        print("Starting main.")
+                         
+        new_controller.speed = 0.3
+        robot_state_machine(new_controller)
+
+    except Exception as e:    
+        print("Error in main: ", traceback.format_exc())   
+        pass
+    
+    try:
+        new_controller.stop_movement()
+                
+        new_controller.destroy_node()
+        print("Calling shutdown.")
+        rclpy.shutdown()
+    except:
+        print("Failed to end main: ", traceback.format_exc())
+        pass
+
+    controller_spin_thread.join()
+    controller_observer_thread.join()
+    
+    print("\n take care of yourself \n")
+    
+    j1 = [x for x in np.array(data)[:,0]]
+    j2 = [x for x in np.array(data)[:,1]]
+    j3 = [x for x in np.array(data)[:,2]]
+    j4 = [x for x in np.array(data)[:,3]]
+    j5 = [x for x in np.array(data)[:,4]]
+    j6 = [x for x in np.array(data)[:,5]]
+    
+    plt.plot(j1, label="Joint 1")
+    plt.plot(j2, label="Joint 2")
+    plt.plot(j3, label="Joint 3")
+    plt.plot(j4, label="Joint 4")
+    plt.plot(j5, label="Joint 5")
+    plt.plot(j6, label="Joint 6")
+    plt.legend()
+    plt.show()
+    
+    j1 = [x for x in np.array(data_c)[:,0]]
+    j2 = [x for x in np.array(data_c)[:,1]]
+    j3 = [x for x in np.array(data_c)[:,2]]
+    j4 = [x for x in np.array(data_c)[:,3]]
+    j5 = [x for x in np.array(data_c)[:,4]]
+    j6 = [x for x in np.array(data_c)[:,5]]
+    
+    plt.plot(j1, label="Joint 1")
+    plt.plot(j2, label="Joint 2")
+    plt.plot(j3, label="Joint 3")
+    plt.plot(j4, label="Joint 4")
+    plt.plot(j5, label="Joint 5")
+    plt.plot(j6, label="Joint 6")
+    plt.legend()
+    plt.show()
+    
+    plt.plot(gaze_velocities_arr, label="Gaze Velocities")
+    plt.legend()
+    plt.show()
+    
+    plt.plot(freq_arr[1:], label="Frequency")
+    plt.legend()
+    plt.show()

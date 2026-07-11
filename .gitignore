@@ -1,0 +1,7 @@
+ros_workspace/build/
+ros_workspace/install/
+ros_workspace/log/
+**.pyc
+**.mp4
+**.pt
+**/.vscode/

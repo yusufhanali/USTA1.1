@@ -1,0 +1,81 @@
+{
+    "transformations": [
+        {
+            "parent_frame_id": "world",
+            "child_frame_id": "map_y_up",
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "qx": 0.7071068,
+            "qy": 0.0,
+            "qz": 0.0,
+            "qw": 0.7071068
+        },
+        {
+            "parent_frame_id": "world",
+            "child_frame_id": "base_link",
+            "x": 1.7513,
+            "y": 0.0955,
+            "z": 0.7347,
+            "qx": 0.0,
+            "qy": 0.0,
+            "qz": 0.3826834,
+            "qw": 0.9238795
+        },
+        {
+            "parent_frame_id": "wrist_3_link",
+            "child_frame_id": "camera_link",
+            "x": 0.0,
+            "y": 0.075,
+            "z": 0.0275,
+            "qx": -0.4846043,
+            "qy": -0.4997629,
+            "qz": -0.4997629,
+            "qw": 0.5153957
+        },
+        {
+            "parent_frame_id": "wrist_3_link",
+            "child_frame_id": "rgb_camera_link",
+            "x": 0.05,
+            "y": 0.075,
+            "z": 0.0275,
+            "qx": 0.49792973,
+            "qy": 0.51267392,
+            "qz": 0.48650938,
+            "qw": -0.50253363
+        },
+        {
+            "parent_frame_id": "base",
+            "child_frame_id": "pick_pose",
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "qx": 0.9238795,
+            "qy": 0.3826834,
+            "qz": 0,
+            "qw": 0
+        },
+        {
+            "parent_frame_id": "base",
+            "child_frame_id": "x_towards_board",
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "qx": 0,
+            "qy": 0,
+            "qz": -0.3826834,
+            "qw": 0.9238795
+        },
+        {
+            "parent_frame_id": "rigid_body_2",
+            "child_frame_id": "helmet_face",
+            "x": 0.0,
+            "y": -0.15,
+            "z": 0.0,
+            "qx": 0,
+            "qy": 0,
+            "qz": 0,
+            "qw": 1
+        }
+    ]
+}
