@@ -18,12 +18,12 @@ class FakeFacePublisher(Node):
         
         self.broadcaster = TransformBroadcaster(self)
         
-        self.head_position = [0.5, 0.0, 1.5]  # x, y, z
-        self.head_orientation = [1.5707963, 0, 0] # axis-angle representation (roll, pitch, yaw), rotvec basically
+        self.head_position = [0.0245, 0.08, 0.029]  # x, y, z
+        self.head_orientation = [-1.2091996, -1.2091996, -1.2091996] # axis-angle representation (roll, pitch, yaw), rotvec basically
         
         self.stdin_fd = sys.stdin.fileno()
-        self.translation_step = 0.002
-        self.rotation_step = 0.1
+        self.translation_step = 0.0005
+        self.rotation_step = 0.01
             
         self.publish_timer = self.create_timer(0.1, self.publish_fake_face)
 
@@ -32,8 +32,8 @@ class FakeFacePublisher(Node):
         
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'world'
-        t.child_frame_id = 'gaze_target'
+        t.header.frame_id = 'wrist_3_link'
+        t.child_frame_id = 'wrist_yifan_camera_link'
         t.transform.translation.x = self.head_position[0]
         t.transform.translation.y = self.head_position[1]
         t.transform.translation.z = self.head_position[2]
@@ -42,6 +42,8 @@ class FakeFacePublisher(Node):
         t.transform.rotation.z = orientation_quat[2]
         t.transform.rotation.w = orientation_quat[3]
         self.broadcaster.sendTransform(t)
+        
+        self.get_logger().info(f'Published fake face transform: position={self.head_position}, orientation={self.head_orientation}')
         
 def read_input(self):
     while rclpy.ok():

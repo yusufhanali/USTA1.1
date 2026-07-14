@@ -12,26 +12,20 @@ if [ $? != 0 ]; then
     tmux send-keys -t $SESSION_UR5E_BRINGUP "export PYTHONPATH=\"\${PYTHONPATH}:/home/kovan/USTA1.1/ros_workspace/src/robot_controller/robot_controller/\"" C-m    
     tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/USTA1.1/ros_workspace/" C-m
     tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run robot_controller breathe_and_gazing"
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run robot_controller experiment_controller"
     
     tmux split-window -v -t $SESSION_UR5E_BRINGUP
     
     tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/mocap4r2_ws/" C-m
     tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
     tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 launch mocap4r2_optitrack_driver optitrack2.launch.py" C-m
+    sleep 2
 
     tmux split-window -h -t $SESSION_UR5E_BRINGUP
-    sleep 2
 
     tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 lifecycle set /mocap4r2_optitrack_driver_node activate" C-m
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 launch ur_robot_driver ur5e.launch.py ur_type:=ur5e robot_ip:=192.168.1.102 kinematics_params_file:=\"/home/kovan/USTA1.1/ur5e_calibration.yaml\"" C-m
-    
-    tmux split-window -h -t $SESSION_UR5E_BRINGUP
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 launch ur_robot_driver ur5e.launch.py ur_type:=ur5e robot_ip:=192.168.1.102 kinematics_params_file:=\"/home/kovan/USTA1.1/bringup/config/ur5e_calibration.yaml\"" C-m
     sleep 2
-    
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/USTA1.1/ros_workspace/" C-m
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run static_transforms static_tf_broadcaster" C-m 
     
     tmux split-window -h -t $SESSION_UR5E_BRINGUP
     
@@ -39,15 +33,35 @@ if [ $? != 0 ]; then
     tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
     tmux send-keys -t $SESSION_UR5E_BRINGUP "colcon build"
     
-    tmux resize-pane -t 0 -y 90% 
+    tmux split-window -h -t $SESSION_UR5E_BRINGUP
     
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/USTA1.1/ros_workspace/" C-m
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run static_transforms static_tf_broadcaster" C-m 
+    
+    tmux resize-pane -t 0 -y 95% 
+
     tmux select-pane -t 0
     tmux split-window -h -t $SESSION_UR5E_BRINGUP
     
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "export PYTHONPATH=\"\${PYTHONPATH}:/home/kovan/USTA1.1/ros_workspace/src/robot_controller/robot_controller/\"" C-m 
     tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/USTA1.1/ros_workspace/" C-m
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run robot_controller fake_face_publisher" 
+
+    tmux split-window -h -t $SESSION_UR5E_BRINGUP
+
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run realsense2_camera realsense2_camera_node --ros-args --params-file /home/kovan/USTA1.1/bringup/config/rs_config.yaml" C-m
+
+    tmux split-window -v -t $SESSION_UR5E_BRINGUP
+
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "b"
+
+    tmux select-pane -t 1
+
+    tmux split-window -v -t $SESSION_UR5E_BRINGUP
+
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "c"
+
+    tmux resize-pane -t 2 -y 90%
+    tmux resize-pane -t 4 -y 90%
     
 fi
 # Attach to the tmux session

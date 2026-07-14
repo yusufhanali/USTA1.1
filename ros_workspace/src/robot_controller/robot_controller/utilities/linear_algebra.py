@@ -1,6 +1,82 @@
 import numpy as np
 from scipy.spatial.transform import Rotation as R    
 
+def rot_x_homogeneous_matrix(theta):
+    """
+    Create a homogeneous transformation matrix for a rotation about the X-axis.
+
+    Parameters:
+        theta (float): Rotation angle in radians.
+
+    Returns:
+        Homogeneous transformation matrix as a np array of shape (4, 4).
+    """
+    c, s = np.cos(theta), np.sin(theta)
+    rotation_matrix = np.array([[1, 0, 0],
+                                 [0, c, -s],
+                                 [0, s, c]])
+    
+    homogeneous_matrix = np.eye(4)
+    homogeneous_matrix[:3, :3] = rotation_matrix
+    
+    return homogeneous_matrix
+
+def rot_y_homogeneous_matrix(theta):
+    """
+    Create a homogeneous transformation matrix for a rotation about the Y-axis.
+
+    Parameters:
+        theta (float): Rotation angle in radians.
+
+    Returns:
+        Homogeneous transformation matrix as a np array of shape (4, 4).
+    """
+    c, s = np.cos(theta), np.sin(theta)
+    rotation_matrix = np.array([[c, 0, s],
+                                 [0, 1, 0],
+                                 [-s, 0, c]])
+    
+    homogeneous_matrix = np.eye(4)
+    homogeneous_matrix[:3, :3] = rotation_matrix
+    
+    return homogeneous_matrix
+
+def rot_z_homogeneous_matrix(theta):
+    """
+    Create a homogeneous transformation matrix for a rotation about the Z-axis.
+
+    Parameters:
+        theta (float): Rotation angle in radians.
+
+    Returns:
+        Homogeneous transformation matrix as a np array of shape (4, 4).
+    """
+    c, s = np.cos(theta), np.sin(theta)
+    rotation_matrix = np.array([[c, -s, 0],
+                                 [s, c, 0],
+                                 [0, 0, 1]])
+    
+    homogeneous_matrix = np.eye(4)
+    homogeneous_matrix[:3, :3] = rotation_matrix
+    
+    return homogeneous_matrix
+
+def translation_homogeneous_matrix(translation_vector):
+    """
+    Create a homogeneous transformation matrix for a translation.
+
+    Parameters:
+        translation_vector (array-like): Translation vector in the form (x, y, z).
+
+    Returns:
+        Homogeneous transformation matrix as a np array of shape (4, 4).
+    """
+    homogeneous_matrix = np.eye(4)
+    homogeneous_matrix[:3, 3] = translation_vector
+    
+    return homogeneous_matrix
+
+
 def quaternion_to_rotation_matrix(quaternion):
     """
     Converts a quaternion into a rotation matrix.

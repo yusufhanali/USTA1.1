@@ -118,6 +118,21 @@ class HeadMimicController(BreatheAndGazeController):
         
         return linear_velocity, angular_velocity
         
+    def velocity_loop(self, runtime):
+        start_time = time.time()
+        while rclpy.ok() and (time.time() - start_time) < runtime:
+                                    
+            head_linear_velocity, head_angular_velocity = self.get_real_head_velocities()
+            head_angular_velocity = np.zeros(3)
+            
+            combined_velocities = np.concatenate((head_linear_velocity, -head_angular_velocity))
+            inv_jacobian = self.get_inverse_jacobian()
+            joint_velocities = inv_jacobian @ combined_velocities
+            
+            self.publish_velocity_command(joint_velocities)
+                                
+            self.ros_rate.sleep()
+    
     def prepare_log_plots(self):
         super().prepare_log_plots()
     
@@ -227,19 +242,7 @@ def main(args=None):
         print(f"Running for {runtime} seconds with target frequency of {target_frequency} Hz.")
         head_mimic_controller.change_control_rate(target_frequency)
                         
-        start_time = time.time()
-        while rclpy.ok() and (time.time() - start_time) < runtime:
-                                    
-            head_linear_velocity, head_angular_velocity = head_mimic_controller.get_real_head_velocities()
-            head_linear_velocity = np.zeros(3)
-            
-            combined_velocities = np.concatenate((head_linear_velocity, -head_angular_velocity))
-            inv_jacobian = head_mimic_controller.get_inverse_jacobian()
-            joint_velocities = inv_jacobian @ combined_velocities
-            
-            head_mimic_controller.publish_velocity_command(joint_velocities)
-                                
-            head_mimic_controller.ros_rate.sleep()
+        head_mimic_controller.velocity_loop(runtime)
 
         head_mimic_controller.stop_movement()
     except KeyboardInterrupt:

@@ -1,0 +1,27 @@
+/**:
+  ros__parameters:
+
+    align_depth.enable: false
+
+    camera_namespace: "yifan"
+    camera_name: "wrist"
+    base_frame_id: "yifan_camera_link"
+
+    device_type: "d435i"
+
+    rgb_camera.profile: "640x480x30"
+    depth_module.profile: "640x480x30"
+
+    enable_accel: false
+    enable_color: true
+    enable_depth: true
+    enable_gyro: false
+    enable_infra1: false
+    enable_infra2: false
+    enable_rgbd: false
+    enable_sync: true
+    
+    pointcloud.enable: true
+    pointcloud.stream_filter: 2 # 2 = COLOR stream
+
+    serial_no: "242622071251"

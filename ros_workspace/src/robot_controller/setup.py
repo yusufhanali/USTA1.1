@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'head_detector = robot_controller.head_detector.head_detector:main',
             'controller = robot_controller.robot_control.new_controller:main',
+            'watchdog = robot_controller.robot_control.watchdog:main',
             'breathe_and_gazing = robot_controller.breathing_gazing.breathe_and_gazing:main',
             'fake_face_publisher = robot_controller.head_detector.fake_face_publisher:main',
             'head_mimic = robot_controller.experiment.head_mimic:main',

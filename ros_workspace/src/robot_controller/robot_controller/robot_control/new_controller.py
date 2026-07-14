@@ -320,7 +320,7 @@ class NewController(Node):
         
     def init_velocity_controller(self):
         # Publish velocity commands
-        self.velocityControllerTopic = "forward_velocity_controller/commands" # All movements should be done w.r.t. "base", not "base_link" or "world"
+        self.velocityControllerTopic = "watchdog/velocity_commands" # All movements should be done w.r.t. "base", not "base_link" or "world"
         self.velocityControllerPub = self.create_publisher(Float64MultiArray, self.velocityControllerTopic, 10)
         
         while not self.velocityControllerPub.get_subscription_count():
@@ -644,7 +644,7 @@ class NewController(Node):
         
         return cubic_spline_controller
 
-    def go_to_pose_in_base_with_cubic_spline(self, desired_coordinate, start_derivative, end_derivative, desired_orientation=None, speed=None):
+    def go_to_pose_in_base_with_cubic_spline(self, desired_coordinate=None, start_derivative=None, end_derivative=None, desired_orientation=None, speed=None):
         if speed is None:
             speed = self.speed
 
