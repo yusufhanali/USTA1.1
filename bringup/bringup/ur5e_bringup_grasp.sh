@@ -57,7 +57,10 @@ if [ $? != 0 ]; then
 
     tmux split-window -v -t $SESSION_UR5E_BRINGUP
 
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "a"
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "export PYTHONPATH=\"\${PYTHONPATH}:/home/kovan/USTA1.1/ros_workspace/src/robot_controller/robot_controller/\"" C-m    
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/USTA1.1/ros_workspace/" C-m
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run robot_controller object_locator" C-m
 
     tmux select-pane -t 1
 

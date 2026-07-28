@@ -25,7 +25,7 @@ class GraspNode(Node):
         
         self.init_tf()
         
-        self.point_cloud_subscriber = self.create_subscription(PointCloud2, '/camera/camera/depth/color/points', self.point_cloud_callback, 10)
+        self.point_cloud_subscriber = self.create_subscription(PointCloud2, '/yifan/wrist/depth/color/points', self.point_cloud_callback, 10)
         
         self.point_cloud_publisher = self.create_publisher(PointCloud2, '/filtered_point_cloud', 10)
         
@@ -43,10 +43,9 @@ class GraspNode(Node):
         z = structured_cloud['z']
 
         mask = (
-            (x >= -0.5) & (x <= 0.5) &
-            (y >= -0.5) & (y <= 0.5) &
-            (z >= 0.0)  & (z <= 1.5)
-        )
+            (x >= -0.2) & (x <= 0.2) &
+            (y >= -0.2) & (y <= 0.2)
+            )
 
         cropped_structured_cloud = structured_cloud[mask]
 
@@ -62,15 +61,9 @@ class GraspNode(Node):
 
         if points.size == 0:
             return
-
-        center_x, center_y = 0.0, 0.0
-        radius = 0.1
-        distances_sq = (points[:, 0] - center_x)**2 + (points[:, 1] - center_y)**2
-        mask = distances_sq <= radius**2
-        filtered_points = points[mask]
         
         header = msg.header
-        filtered_msg = pc2.create_cloud_xyz32(header, filtered_points.tolist())
+        filtered_msg = pc2.create_cloud_xyz32(header, points.tolist())
         self.point_cloud_publisher.publish(filtered_msg)
         
                 

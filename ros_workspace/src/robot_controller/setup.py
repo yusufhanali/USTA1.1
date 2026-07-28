@@ -32,6 +32,7 @@ setup(
             'neo_mimic = robot_controller.experiment.neo_mimic:main',
             'experiment_controller = robot_controller.experiment.exp_src:main',
             'grasp_manager = robot_controller.contact_graspnet.grasp:main',
+            'object_locator = robot_controller.experiment.object_locator:main',
         ],
     },
 )

@@ -826,15 +826,16 @@ class NewController(Node):
         if self.figure_index > 0:
             plt.show()
         
-    def start_controller(self, speed=0.3):
+    def start_controller(self, speed=0.3, go_home=True):
         self.speed = speed
         self.init_log_buffers()
         
         self.get_logger().info(f"Controller started with speed: {self.speed}")
         
-        self.get_logger().info("Going to home position...")
-        self.go_to_home_pos(speed=self.speed)
-        self.get_logger().info("Home position reached.")
+        if go_home:
+            self.get_logger().info("Going to home position...")
+            self.go_to_home_pos(speed=self.speed)
+            self.get_logger().info("Home position reached.")
     
     
     def shutdown_controller(self):

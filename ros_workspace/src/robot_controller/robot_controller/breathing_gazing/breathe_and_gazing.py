@@ -69,7 +69,7 @@ class BreatheAndGazeController(NewController):
         self.log_breath_forwards = False
 
 
-    def set_breathing_gazing(self):        
+    def set_breathing_gazing(self, go_home=True):        
         try:
             self.breathing_task = np.zeros(3)
             self.target_in_base_position = np.zeros(3)
@@ -80,7 +80,9 @@ class BreatheAndGazeController(NewController):
             self.target_position_smoother = control_and_filters_utils.VectorLinearFilter(alpha=0.2, dimension=3)
             
             self.gripper.close_async()
-            self.go_to_home_pos(0.3)                    
+            
+            if go_home:
+                self.go_to_home_pos(0.3)                    
                     
             if self.do_breathing:
                 self.init_breather()
@@ -324,10 +326,10 @@ class BreatheAndGazeController(NewController):
             #plt.show(block=False)
 
 
-    def start_controller(self, speed=0.3):
-        super().start_controller(speed)
+    def start_controller(self, speed=0.3, go_home=True):
+        super().start_controller(speed, go_home)
         
-        self.set_breathing_gazing()
+        self.set_breathing_gazing(go_home=go_home)
         
         
 def spin_thread(node, executor=None):

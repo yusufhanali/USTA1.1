@@ -251,6 +251,26 @@ def reverse_homogeneous_matrix(matrix):
     new_matrix[0:3, 3] = -1 * np.transpose(matrix[0:3, 0:3]) @ matrix[0:3, 3]
     return new_matrix
 
+def tf_transform_to_homogeneous_matrix(tf_transform):
+    """
+    Converts a ROS2 Transform message to a homogeneous transformation matrix.
+
+    Parameters:
+        tf_transform (geometry_msgs.msg.Transform): ROS2 Transform message.
+
+    Returns:
+        Homogeneous transformation matrix as a np array of shape (4, 4).
+    """
+    translation = tf_transform.translation
+    rotation = tf_transform.rotation
+
+    translation_vector = np.array([translation.x, translation.y, translation.z])
+    rotation_quaternion = np.array([rotation.x, rotation.y, rotation.z, rotation.w])
+
+    rotation_matrix = quaternion_to_rotation_matrix(rotation_quaternion)
+    homogeneous_matrix = rotation_matrix_to_homogeneous_matrix(rotation_matrix, translation_vector)
+
+    return homogeneous_matrix
 
 def angle_between_vectors(v1, v2):
     """
