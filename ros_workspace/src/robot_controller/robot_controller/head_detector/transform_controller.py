@@ -6,34 +6,35 @@ from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 
 from scipy.spatial.transform import Rotation as R    
+import numpy as np
 
 import sys
 import tty
 import termios
 import threading
 
-class FakeFacePublisher(Node):
+class TransformController(Node):
     def __init__(self):
-        super().__init__('fake_face_publisher')
+        super().__init__('transform_controller')
         
         self.broadcaster = TransformBroadcaster(self)
         
-        self.head_position = [0.0245, 0.08, 0.029]  # x, y, z
-        self.head_orientation = [-1.2091996, -1.2091996, -1.2091996] # axis-angle representation (roll, pitch, yaw), rotvec basically
+        self.head_position = [0.92, -1.503, 2.247]  # x, y, z
+        self.head_orientation = [np.pi/2, np.pi/4, 0.024] # aerial xyz
         
         self.stdin_fd = sys.stdin.fileno()
         self.translation_step = 0.0005
-        self.rotation_step = 0.01
+        self.rotation_step = 0.0002
             
-        self.publish_timer = self.create_timer(0.1, self.publish_fake_face)
+        self.publish_timer = self.create_timer(0.1, self.publish_tf)
 
-    def publish_fake_face(self):        
-        orientation_quat = R.from_rotvec(self.head_orientation).as_quat()
+    def publish_tf(self):
+        orientation_quat = R.from_euler('ZYZ', self.head_orientation).as_quat()  # Convert to xyzw format
         
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'wrist_3_link'
-        t.child_frame_id = 'wrist_yifan_camera_link'
+        t.header.frame_id = 'world'
+        t.child_frame_id = 'overhead_hri_camera_link'
         t.transform.translation.x = self.head_position[0]
         t.transform.translation.y = self.head_position[1]
         t.transform.translation.z = self.head_position[2]
@@ -43,7 +44,7 @@ class FakeFacePublisher(Node):
         t.transform.rotation.w = orientation_quat[3]
         self.broadcaster.sendTransform(t)
         
-        self.get_logger().info(f'Published fake face transform: position={self.head_position}, orientation={self.head_orientation}')
+        print(f'position={self.head_position}, orientation={self.head_orientation}, orientation_quat={orientation_quat}', end='\r')  # Print on the same line
         
 def read_input(self):
     while rclpy.ok():
@@ -72,12 +73,20 @@ def read_input(self):
                 elif ch == 'f':
                     self.head_orientation[0] -= self.rotation_step
                 elif ch == 't':
-                    self.translation_step += 0.1
-                elif ch == 'y':
-                    self.translation_step = max(0.1, self.translation_step - 0.1)
+                    self.head_orientation[1] += self.rotation_step
                 elif ch == 'g':
-                    self.rotation_step += 0.1
+                    self.head_orientation[1] -= self.rotation_step
+                elif ch == 'y':
+                    self.head_orientation[2] += self.rotation_step
                 elif ch == 'h':
+                    self.head_orientation[2] -= self.rotation_step
+                elif ch == 'u':
+                    self.translation_step += 0.1
+                elif ch == 'j':
+                    self.translation_step = max(0.1, self.translation_step - 0.1)
+                elif ch == 'ı':
+                    self.rotation_step += 0.1
+                elif ch == 'k':
                     self.rotation_step = max(0.1, self.rotation_step - 0.1)        
                     
                 elif ch == 'x':
@@ -88,7 +97,7 @@ def read_input(self):
     
 def main(args=None):
     rclpy.init(args=args)
-    node = FakeFacePublisher()
+    node = TransformController()
     
     input_thread = threading.Thread(target=read_input, args=(node,))
     input_thread.daemon = True

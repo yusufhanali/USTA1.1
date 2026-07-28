@@ -184,7 +184,7 @@ class UR5eWatchdog(Node):
         '''
             Use this function to register all the constraints that you want to apply to the robot. This function is called in the constructor of the class.
         '''
-        self.constraint_functions.append(self.height_constraint)
+        #self.constraint_functions.append(self.height_constraint)
         self.constraint_functions.append(self.joint_limit_constraint)
         
     def height_constraint(self, commanded_velocity):
@@ -199,17 +199,17 @@ class UR5eWatchdog(Node):
         commanded_z = current_z + cartesian_velocity[2] * (1 / self.control_rate)
         
         if cartesian_velocity[2] > 0 and commanded_z > max_z - caution_distance:
-            self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) > max_z - caution_distance ({max_z - caution_distance})")
+            #self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) > max_z - caution_distance ({max_z - caution_distance})")
             if commanded_z > max_z:
-                self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) > max_z ({max_z})")
+                #self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) > max_z ({max_z})")
                 cartesian_velocity[2] = 0
             else:
                 cartesian_velocity[2] = ((max_z - commanded_z) / (caution_distance)) * cartesian_velocity[2]
         
         elif cartesian_velocity[2] < 0 and commanded_z < min_z + caution_distance:
-            self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) < min_z + caution_distance ({min_z + caution_distance})")
+            #self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) < min_z + caution_distance ({min_z + caution_distance})")
             if commanded_z < min_z:
-                self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) < min_z ({min_z})")
+                #self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) < min_z ({min_z})")
                 cartesian_velocity[2] = 0
             else:
                 cartesian_velocity[2] = ((commanded_z - min_z) / (caution_distance)) * cartesian_velocity[2]
@@ -226,7 +226,7 @@ class UR5eWatchdog(Node):
             [-3.5, 0.25],  # Joint 2 limits
             [-2.54, 2.1],  # Joint 3 limits
             [-2*np.pi, 2*np.pi], # Joint 4 limits
-            [-2*np.pi, (7*np.pi)/9],  # Joint 5 limits
+            [-2*np.pi, (3*np.pi)/4],  # Joint 5 limits
             [-2*np.pi, 2*np.pi]   # Joint 6 limits
         ])
         caution_angle = 0.15  # radians
@@ -238,17 +238,17 @@ class UR5eWatchdog(Node):
         
         for i, command in enumerate(commanded_velocity):
             if command > 0 and commanded_joint_positions[i] > joint_limits[i][1] - caution_angle:
-                self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds cautionary limit.")
+                #self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds cautionary limit.")
                 if commanded_joint_positions[i] > joint_limits[i][1]:
-                    self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds upper limit.")
+                    #self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds upper limit.")
                     altered_velocity[i] = 0
                 else:
                     altered_velocity[i] = ((joint_limits[i][1] - (commanded_joint_positions[i])) / caution_angle) * command
                     
             elif command < 0 and commanded_joint_positions[i] < joint_limits[i][0] + caution_angle:
-                self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds cautionary limit.")
+                #self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds cautionary limit.")
                 if commanded_joint_positions[i] < joint_limits[i][0]:
-                    self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds lower limit.")
+                    #self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds lower limit.")
                     altered_velocity[i] = 0
                 else:
                     altered_velocity[i] = ((commanded_joint_positions[i] - joint_limits[i][0]) / caution_angle) * command

@@ -25,13 +25,24 @@
         {
             "parent_frame_id": "wrist_3_link",
             "child_frame_id": "wrist_yifan_camera_link",
-            "x": 0.02,
-            "y": 0.08,
-            "z": 0.028,
-            "qx": -0.5,
-            "qy": -0.5,
-            "qz": -0.5,
-            "qw": 0.5
+            "x": 0.0162,
+            "y": 0.0788,
+            "z": 0.0268,
+            "qx": -0.493136,
+            "qy": -0.510704,
+            "qz": -0.493243,
+            "qw": 0.502703
+        },
+        {
+            "parent_frame_id": "world",
+            "child_frame_id": "overhead_hri_camera_link",
+            "x": 0.8765,
+            "y": -1.503,
+            "z": 2.247,
+            "qx": -0.26430327,
+            "qy": 0.27674969,
+            "qz": 0.65393444,
+            "qw": 0.65262787
         },
         {
             "parent_frame_id": "base",
@@ -59,8 +70,8 @@
             "parent_frame_id": "rigid_body_2",
             "child_frame_id": "helmet_face",
             "x": 0.0,
-            "y": -0.15,
-            "z": 0.0,
+            "y": -0.135,
+            "z": -0.04,
             "qx": 0,
             "qy": 0,
             "qz": 0,

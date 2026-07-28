@@ -399,6 +399,9 @@ class NewController(Node):
         
         self.world_to_base_homogeneous = linalg_utils.reverse_homogeneous_matrix(self.base_to_world_homogeneous)
         
+        self.base_to_x_towards_board = linalg_utils.rot_z_matrix(np.pi/4)
+        self.x_towards_board_to_base = linalg_utils.rot_z_matrix(-np.pi/4)
+        
         self.first_movement = True        
         self.prev_velocities = np.zeros(6)
         
@@ -689,13 +692,13 @@ class NewController(Node):
             return
         self.marker_array_publisher.publish(marker_array)
   
-    def publish_arrow(self, start_pos = np.zeros(3), end_pos = np.zeros(3), frame = "base"):
+    def publish_arrow(self, start_pos = np.zeros(3), end_pos = np.zeros(3), frame = "base", id = 0):
         # Publish an arrow from start_pos to curr_target
         arrow_marker = Marker()
         arrow_marker.header.frame_id = frame
         arrow_marker.header.stamp = self.get_clock().now().to_msg()
         arrow_marker.ns = "arrow"
-        arrow_marker.id = 0
+        arrow_marker.id = id
         arrow_marker.type = Marker.ARROW
         arrow_marker.action = Marker.ADD
         arrow_marker.scale.x = 0.02  # Arrow shaft diameter
@@ -715,7 +718,7 @@ class NewController(Node):
         # Publish the arrow marker
         self.publish_marker(arrow_marker)
 
-    def publish_ball(self, position = np.zeros(3), radius=0.02, marker_id=0, frame="base"):
+    def publish_ball(self, position = np.zeros(3), radius=0.02, marker_id=0, frame="base", color=(0.0, 1.0, 0.0, 1.0)):
         ball_marker = Marker()
         ball_marker.header.frame_id = frame
         ball_marker.header.stamp = self.get_clock().now().to_msg()
@@ -726,10 +729,10 @@ class NewController(Node):
         ball_marker.scale.x = radius * 2  # Diameter in x
         ball_marker.scale.y = radius * 2  # Diameter in y
         ball_marker.scale.z = radius * 2  # Diameter in z
-        ball_marker.color.r = 0.0
-        ball_marker.color.g = 1.0
-        ball_marker.color.b = 0.0
-        ball_marker.color.a = 1.0
+        ball_marker.color.r = color[0]
+        ball_marker.color.g = color[1]
+        ball_marker.color.b = color[2]
+        ball_marker.color.a = color[3]
 
         # Set the ball position
         ball_marker.pose.position = Point(x=position[0], y=position[1], z=position[2])

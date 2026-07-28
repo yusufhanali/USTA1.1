@@ -12,7 +12,7 @@ if [ $? != 0 ]; then
     tmux send-keys -t $SESSION_UR5E_BRINGUP "export PYTHONPATH=\"\${PYTHONPATH}:/home/kovan/USTA1.1/ros_workspace/src/robot_controller/robot_controller/\"" C-m    
     tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/USTA1.1/ros_workspace/" C-m
     tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run robot_controller neo_mimic"
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run robot_controller experiment_controller"
     
     tmux split-window -v -t $SESSION_UR5E_BRINGUP
     
@@ -51,20 +51,23 @@ if [ $? != 0 ]; then
 
     tmux split-window -h -t $SESSION_UR5E_BRINGUP
 
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "a"
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/USTA1.1/ros_workspace/" C-m
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 launch robot_controller realsense_launch.py" C-m
 
     tmux split-window -v -t $SESSION_UR5E_BRINGUP
-    
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run realsense2_camera realsense2_camera_node --ros-args --params-file /home/kovan/USTA1.1/bringup/config/rs_config.yaml" C-m
+
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "a"
 
     tmux select-pane -t 1
 
     tmux split-window -v -t $SESSION_UR5E_BRINGUP
 
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "export PYTHONPATH=\"\${PYTHONPATH}:/home/kovan/USTA1.1/ros_workspace/src/robot_controller/robot_controller/\"" C-m    
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "conda activate contact_graspnet_env" C-m
     tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/USTA1.1/ros_workspace/" C-m
     tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run robot_controller transform_controller"
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "python install/robot_controller/lib/robot_controller/grasp_manager"
+
 
     tmux resize-pane -t 2 -y 90%
     tmux resize-pane -t 4 -y 90%

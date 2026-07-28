@@ -1,4 +1,6 @@
 from setuptools import find_packages, setup
+import os
+from glob import glob
 
 package_name = 'robot_controller'
 
@@ -10,6 +12,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -24,9 +27,11 @@ setup(
             'controller = robot_controller.robot_control.new_controller:main',
             'watchdog = robot_controller.robot_control.watchdog:main',
             'breathe_and_gazing = robot_controller.breathing_gazing.breathe_and_gazing:main',
-            'fake_face_publisher = robot_controller.head_detector.fake_face_publisher:main',
+            'transform_controller = robot_controller.head_detector.transform_controller:main',
             'head_mimic = robot_controller.experiment.head_mimic:main',
+            'neo_mimic = robot_controller.experiment.neo_mimic:main',
             'experiment_controller = robot_controller.experiment.exp_src:main',
+            'grasp_manager = robot_controller.contact_graspnet.grasp:main',
         ],
     },
 )

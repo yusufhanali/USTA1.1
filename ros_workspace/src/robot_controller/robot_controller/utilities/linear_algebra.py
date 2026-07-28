@@ -1,6 +1,54 @@
 import numpy as np
 from scipy.spatial.transform import Rotation as R    
 
+def rot_x_matrix(theta):
+    """
+    Create a rotation matrix for a rotation about the X-axis.
+
+    Parameters:
+        theta (float): Rotation angle in radians.
+
+    Returns:
+        Rotation matrix as a np array of shape (3, 3).
+    """
+    c, s = np.cos(theta), np.sin(theta)
+    rotation_matrix = np.array([[1, 0, 0],
+                                 [0, c, -s],
+                                 [0, s, c]])
+    return rotation_matrix
+
+def rot_y_matrix(theta):
+    """
+    Create a rotation matrix for a rotation about the Y-axis.
+
+    Parameters:
+        theta (float): Rotation angle in radians.
+
+    Returns:
+        Rotation matrix as a np array of shape (3, 3).
+    """
+    c, s = np.cos(theta), np.sin(theta)
+    rotation_matrix = np.array([[c, 0, s],
+                                 [0, 1, 0],
+                                 [-s, 0, c]])
+    return rotation_matrix
+
+def rot_z_matrix(theta):
+    """
+    Create a rotation matrix for a rotation about the Z-axis.
+
+    Parameters:
+        theta (float): Rotation angle in radians.
+
+    Returns:
+        Rotation matrix as a np array of shape (3, 3).
+    """
+    c, s = np.cos(theta), np.sin(theta)
+    rotation_matrix = np.array([[c, -s, 0],
+                                 [s, c, 0],
+                                 [0, 0, 1]])
+    return rotation_matrix
+
 def rot_x_homogeneous_matrix(theta):
     """
     Create a homogeneous transformation matrix for a rotation about the X-axis.
@@ -202,3 +250,21 @@ def reverse_homogeneous_matrix(matrix):
     new_matrix[0:3, 0:3] = np.transpose(matrix[0:3, 0:3])
     new_matrix[0:3, 3] = -1 * np.transpose(matrix[0:3, 0:3]) @ matrix[0:3, 3]
     return new_matrix
+
+
+def angle_between_vectors(v1, v2):
+    """
+    Calculate the angle between two vectors in radians.
+
+    Parameters:
+        v1 (array-like): First vector.
+        v2 (array-like): Second vector.
+
+    Returns:
+        Angle between the vectors in radians.
+    """
+    v1 = np.array(v1)
+    v2 = np.array(v2)
+    cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    return np.arccos(cos_angle)

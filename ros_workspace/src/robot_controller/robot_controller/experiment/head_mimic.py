@@ -4,6 +4,7 @@ import time
 
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.spatial.transform import Rotation as R
 
 import rclpy
 from rclpy.signals import SignalHandlerOptions
@@ -16,6 +17,8 @@ from utilities.control_and_filters import LinearFilter
 class HeadMimicController(BreatheAndGazeController):
     def __init__(self):
         super().__init__()
+        
+        #self.gaze_target_name = 'gaze_target'
         
         self.prev_head_position = None
         self.prev_head_orientation = None
@@ -123,7 +126,12 @@ class HeadMimicController(BreatheAndGazeController):
         while rclpy.ok() and (time.time() - start_time) < runtime:
                                     
             head_linear_velocity, head_angular_velocity = self.get_real_head_velocities()
-            head_angular_velocity = np.zeros(3)
+
+            head_angular_velocity = self.base_to_x_towards_board @ head_angular_velocity
+            head_angular_velocity = R.from_rotvec(head_angular_velocity).as_euler('zyx')
+            head_angular_velocity[2] = -head_angular_velocity[2]
+            head_angular_velocity = R.from_euler('zyx', head_angular_velocity).as_rotvec()
+            head_angular_velocity = self.x_towards_board_to_base @ head_angular_velocity
             
             combined_velocities = np.concatenate((head_linear_velocity, -head_angular_velocity))
             inv_jacobian = self.get_inverse_jacobian()
