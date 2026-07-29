@@ -19,8 +19,8 @@ class TransformController(Node):
         
         self.broadcaster = TransformBroadcaster(self)
         
-        self.head_position = [0.92, -1.503, 2.247]  # x, y, z
-        self.head_orientation = [np.pi/2, np.pi/4, 0.024] # aerial xyz
+        self.head_position = [0.0162, 0.0788, 0.0268]  # x, y, z
+        self.head_orientation = [-np.pi/2, -np.pi/2, 0.0] # aerial xyz
         
         self.stdin_fd = sys.stdin.fileno()
         self.translation_step = 0.0005
@@ -33,8 +33,8 @@ class TransformController(Node):
         
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'world'
-        t.child_frame_id = 'overhead_hri_camera_link'
+        t.header.frame_id = 'wrist_3_link'
+        t.child_frame_id = 'wrist_yifan_camera_link'
         t.transform.translation.x = self.head_position[0]
         t.transform.translation.y = self.head_position[1]
         t.transform.translation.z = self.head_position[2]

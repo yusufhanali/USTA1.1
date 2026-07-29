@@ -5,3 +5,4 @@ ros_workspace/log/
 **.mp4
 **.pt
 **/.vscode/
+**/cgn_pytorch_src/

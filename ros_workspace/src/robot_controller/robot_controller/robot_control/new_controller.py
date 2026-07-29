@@ -376,7 +376,7 @@ class NewController(Node):
         self.get_logger().info('present day,')
         
         # Initialize control rate
-        self.control_rate = 600 # Hz
+        self.control_rate = 500 # Hz
         self.ros_rate = self.create_rate(self.control_rate, self.get_clock())
         
         self.base = "base"
@@ -692,7 +692,7 @@ class NewController(Node):
             return
         self.marker_array_publisher.publish(marker_array)
   
-    def publish_arrow(self, start_pos = np.zeros(3), end_pos = np.zeros(3), frame = "base", id = 0):
+    def publish_arrow(self, start_pos = np.zeros(3), end_pos = np.zeros(3), frame = "base", id = 0, color = (0.0, 0.0, 1.0, 1.0)):
         # Publish an arrow from start_pos to curr_target
         arrow_marker = Marker()
         arrow_marker.header.frame_id = frame
@@ -704,10 +704,10 @@ class NewController(Node):
         arrow_marker.scale.x = 0.02  # Arrow shaft diameter
         arrow_marker.scale.y = 0.04  # Arrow head diameter
         arrow_marker.scale.z = 0.04  # Arrow head length
-        arrow_marker.color.r = 0.0
-        arrow_marker.color.g = 0.0
-        arrow_marker.color.b = 1.0
-        arrow_marker.color.a = 1.0
+        arrow_marker.color.r = color[0]
+        arrow_marker.color.g = color[1]
+        arrow_marker.color.b = color[2]
+        arrow_marker.color.a = color[3]
 
         # Set the arrow start and end points
         arrow_marker.points = [

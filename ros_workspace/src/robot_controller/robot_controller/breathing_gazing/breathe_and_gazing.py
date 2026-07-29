@@ -93,7 +93,7 @@ class BreatheAndGazeController(NewController):
             print("Error in setting breathing and gazing: ", traceback.format_exc())
             self.stop_movement()
 
-    def get_gaze_velocities(self, target_position = [0.5, 0.25, 0.4], target_orientation = [0.7071068, 0, 0, 0.7071068], breathing_task = np.zeros(3), waist_ratio = 0.4):
+    def get_gaze_velocities(self, target_position = [0.5, 0.25, 0.4], target_orientation = [0.7071068, 0, 0, 0.7071068], breathing_task = np.zeros(3), waist_ratio = 0.4, joint_limits = np.array([1 , 1.5, 1, 2.5])):
         
         waist = 0 # the base joint, the first one
         wrist1 = 0
@@ -101,6 +101,8 @@ class BreatheAndGazeController(NewController):
         wrist3 = 0
         
         target_in_w3_pos = np.zeros(3)
+
+        total_error = np.zeros(4)
 
         try:
             
@@ -111,7 +113,7 @@ class BreatheAndGazeController(NewController):
                                                 target_orientation[3]]).as_matrix()
             target_to_world_homo[0:3, 3] = np.array([target_position[0],
                                         target_position[1],
-                                        target_position[2]])     
+                                        target_position[2]])
                
             ee_in_world = self.get_current_coordinate()
             ee_in_world = self.base_to_world_homogeneous @ np.concatenate((ee_in_world, [1]))
@@ -120,8 +122,9 @@ class BreatheAndGazeController(NewController):
             dist_to_target = np.linalg.norm(pos)
             dist_to_target = dist_to_target * 0.1 + self.prev_dist_to_target * 0.9
             self.prev_dist_to_target = dist_to_target
-            self.gaze_multiplier = (2.5)*dist_to_target + 1.7 # magic
-            if self.do_breathing:
+            self.gaze_multiplier = 3
+            if self.do_breathing and breathing_task.any():
+                self.gaze_multiplier = (2.5)*dist_to_target + 1.7 # magic
                 freq = self.breathe_controller.freq
                 self.gaze_multiplier /= freq*3  # Slow down gazing when breathing is fast
             
@@ -154,11 +157,13 @@ class BreatheAndGazeController(NewController):
                 wrist1 = -wrist1 if target_in_w1_pos[0] > 0 else wrist1
                 wrist1 = geometry_utils.angular_wrap(wrist1)
                                 
-                gazing_velocities[1] = wrist1 * self.gaze_multiplier                
-                if abs(gazing_velocities[1]) > 2.5:
-                    gazing_velocities[1] = np.sign(gazing_velocities[1]) * 2.5
+                gazing_velocities[1] = wrist1 * self.gaze_multiplier
+                total_error[1] = wrist1          
+                if abs(gazing_velocities[1]) > joint_limits[1]:
+                    gazing_velocities[1] = np.sign(gazing_velocities[1]) * joint_limits[1]
                 elif abs(gazing_velocities[1]) < 0.03:
                     gazing_velocities[1] = 0
+                    total_error[1] = 0
                     
                 #wrist2
                 base_to_w2 = ur5e_kinematics.base_to_wrist2_transformation(self.joint_states_global["pos"])
@@ -176,10 +181,12 @@ class BreatheAndGazeController(NewController):
                 wrist2 = geometry_utils.angular_wrap(wrist2)
                 
                 gazing_velocities[2] = wrist2 * self.gaze_multiplier * (1 - waist_ratio)
-                if abs(gazing_velocities[2]) > 1:
-                    gazing_velocities[2] = np.sign(gazing_velocities[2]) * 1
+                total_error[2] = wrist2 * (1 - waist_ratio)
+                if abs(gazing_velocities[2]) > joint_limits[2]:
+                    gazing_velocities[2] = np.sign(gazing_velocities[2]) * joint_limits[2]
                 elif abs(gazing_velocities[2]) < 0.03:
                     gazing_velocities[2] = 0
+                    total_error[2] = 0
                 #gazing_velocities[2] *= 0.5 # retards wrist2 movement, makes it less aggressive.
                     
                 #waist
@@ -196,10 +203,12 @@ class BreatheAndGazeController(NewController):
                 waist = geometry_utils.angular_wrap(waist)
                 
                 gazing_velocities[0] = waist * self.gaze_multiplier * waist_ratio
-                if abs(gazing_velocities[0]) > 1:
-                    gazing_velocities[0] = np.sign(gazing_velocities[0]) * 1
+                total_error[0] = waist * waist_ratio
+                if abs(gazing_velocities[0]) > joint_limits[0]:
+                    gazing_velocities[0] = np.sign(gazing_velocities[0]) * joint_limits[0]
                 elif abs(gazing_velocities[0]) < 0.03:
                     gazing_velocities[0] = 0
+                    total_error[0] = 0
                 
                 #gazing_velocities[0] *= 0.4 # retards waist movement, makes it less aggressive. 
                 
@@ -219,10 +228,12 @@ class BreatheAndGazeController(NewController):
                 target_in_w3_pos = np.array([target_in_w3[0, 3], target_in_w3[1, 3], target_in_w3[2, 3]])
                 
                 gazing_velocities[3] = wrist3 * 4# * self.gaze_multiplier
-                if abs(gazing_velocities[3]) > 2.5:
-                    gazing_velocities[3] = np.sign(gazing_velocities[3]) * 2.5
+                total_error[3] = wrist3
+                if abs(gazing_velocities[3]) > joint_limits[3]:
+                    gazing_velocities[3] = np.sign(gazing_velocities[3]) * joint_limits[3]
                 elif abs(gazing_velocities[3]) < 0.03:
                     gazing_velocities[3] = 0
+                    total_error[3] = 0
                 #gazing_velocities[3] *= 0.5 # retards wrist3 movement, makes it less aggressive.                          
                 
                 gazing_velocities = self.gaze_filter.filter(gazing_velocities)
@@ -236,11 +247,11 @@ class BreatheAndGazeController(NewController):
                 #print(f"Gazing velocities: {gazing_velocities}\nDistance to target: {dist_to_target}\nGaze multiplier: {self.gaze_multiplier}\n", end="\r")
                 
                 target_in_base_position = np.array([target_to_base[0, 3], target_to_base[1, 3], target_to_base[2, 3]])
-                return gazing_velocities, target_in_base_position
+                return gazing_velocities, target_in_base_position, total_error
             
         except Exception as e:
             print("Error in getting gaze velocities: ", traceback.format_exc())
-            return np.zeros(self.num_of_gazing_joints), np.zeros(3)
+            return np.zeros(self.num_of_gazing_joints), np.zeros(3), np.zeros(4)
 
     def get_breathe_velocities(self, forward_movement=0.0):
         
@@ -284,7 +295,7 @@ class BreatheAndGazeController(NewController):
                 target_position = [target_in_world.transform.translation.x, target_in_world.transform.translation.y, target_in_world.transform.translation.z]
                 target_position = self.target_position_smoother.filter(target_position)
                 target_orientation = [target_in_world.transform.rotation.x, target_in_world.transform.rotation.y, target_in_world.transform.rotation.z, target_in_world.transform.rotation.w]
-                gaze_velocities, self.target_in_base_position = self.get_gaze_velocities(target_position=target_position,
+                gaze_velocities, self.target_in_base_position, _ = self.get_gaze_velocities(target_position=target_position,
                                                                                                            target_orientation=target_orientation,
                                                                                                            breathing_task=np.array([self.breathing_task[0], 0.0, self.breathing_task[1]]),
                                                                                                            waist_ratio=0.5

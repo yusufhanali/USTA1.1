@@ -69,22 +69,26 @@ class ObjectLocatorNode(Node):
 
             while True:
                 frames = self.rs_pipeline.wait_for_frames()
-                aligned_frames = self.rs_align.process(frames)
 
-                aligned_depth_frame = aligned_frames.get_depth_frame()
-                color_frame = aligned_frames.get_color_frame()
-
-                if not aligned_depth_frame or not color_frame:
-                    self.get_logger().warning("Frame not available.")
+                if not frames:
+                    self.get_logger().warning("Frames not available.")
                     continue
-
-                depth_intrin = aligned_depth_frame.profile.as_video_stream_profile().intrinsics
-
-                color_image = np.asanyarray(color_frame.get_data())
 
                 if self.clicked_u != -1 and self.clicked_v != -1:
                     u, v = self.clicked_u, self.clicked_v
+                    
+                    aligned_frames = self.rs_align.process(frames)                    
+                    aligned_depth_frame = aligned_frames.get_depth_frame()
+                    color_frame = aligned_frames.get_color_frame()
+                
+                    if not aligned_depth_frame or not color_frame:
+                        self.get_logger().warning("Frame not available.")
+                        continue
+                
+                    color_image = np.asanyarray(color_frame.get_data())
+                    
                     depth_value = aligned_depth_frame.get_distance(u, v)
+                    depth_intrin = aligned_depth_frame.profile.as_video_stream_profile().intrinsics
                     depth_point = rs.rs2_deproject_pixel_to_point(depth_intrin, [u, v], depth_value)
                     
                     self.last_clicked_u, self.last_clicked_v = self.clicked_u, self.clicked_v
@@ -92,6 +96,9 @@ class ObjectLocatorNode(Node):
                     
                     self.publish_point(depth_point[2], -depth_point[0], -depth_point[1])
                     self.get_logger().info(f"Clicked Pixel\n(u, v): ({self.clicked_u}, {self.clicked_v})\n3D Coordinates: ({depth_point[0]:.3f}, {depth_point[1]:.3f}, {depth_point[2]:.3f})")
+                else:
+                    color_frame = frames.get_color_frame()
+                    color_image = np.asanyarray(color_frame.get_data())
 
                 if self.last_clicked_u != -1 and self.last_clicked_v != -1:
                     cv2.circle(color_image, (self.last_clicked_u, self.last_clicked_v), 5, (0, 0, 180), -1)
