@@ -99,8 +99,6 @@ class BreatheAndGazeController(NewController):
         wrist1 = 0
         wrist2 = 0
         wrist3 = 0
-        
-        target_in_w3_pos = np.zeros(3)
 
         total_error = np.zeros(4)
 
@@ -202,6 +200,11 @@ class BreatheAndGazeController(NewController):
                 waist = waist if target_in_shoulder_pos[1] > 0 else -waist
                 waist = geometry_utils.angular_wrap(waist)
                 
+                if waist + self.joint_states_global["pos"][0] <= ur5e_kinematics.JOINT_LIMITS[0, 0]:
+                    waist = waist + 2*np.pi
+                elif waist + self.joint_states_global["pos"][0] >= ur5e_kinematics.JOINT_LIMITS[0, 1]:
+                    waist = waist - 2*np.pi
+                
                 gazing_velocities[0] = waist * self.gaze_multiplier * waist_ratio
                 total_error[0] = waist * waist_ratio
                 if abs(gazing_velocities[0]) > joint_limits[0]:
@@ -224,9 +227,7 @@ class BreatheAndGazeController(NewController):
                     wrist3 = 0
                 wrist3 = -wrist3 if target_in_w3_y[0] > 0 else wrist3
                 wrist3 = geometry_utils.angular_wrap(wrist3)
-                
-                target_in_w3_pos = np.array([target_in_w3[0, 3], target_in_w3[1, 3], target_in_w3[2, 3]])
-                
+                                
                 gazing_velocities[3] = wrist3 * 4# * self.gaze_multiplier
                 total_error[3] = wrist3
                 if abs(gazing_velocities[3]) > joint_limits[3]:

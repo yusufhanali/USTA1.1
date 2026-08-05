@@ -17,8 +17,8 @@ class ObjectLocatorNode(Node):
         self.rs_pipeline = rs.pipeline()
         config = rs.config()
 
-        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
+        config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
 
         config.enable_device("313522301714")
 
@@ -93,6 +93,10 @@ class ObjectLocatorNode(Node):
                     
                     self.last_clicked_u, self.last_clicked_v = self.clicked_u, self.clicked_v
                     self.clicked_u, self.clicked_v = -1, -1
+                    
+                    if depth_value == 0:
+                        self.get_logger().warning(f"Depth value at pixel ({u}, {v}) is zero. Cannot compute 3D coordinates.")
+                        continue
                     
                     self.publish_point(depth_point[2], -depth_point[0], -depth_point[1])
                     self.get_logger().info(f"Clicked Pixel\n(u, v): ({self.clicked_u}, {self.clicked_v})\n3D Coordinates: ({depth_point[0]:.3f}, {depth_point[1]:.3f}, {depth_point[2]:.3f})")

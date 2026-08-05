@@ -6,6 +6,15 @@ from numpy import arctan as atan
 
 NUM_OF_JOINTS = 6
 
+JOINT_LIMITS = np.array([
+            [-2*np.pi, 2*np.pi],  # Joint 1 limits
+            [-3.6, 0.15],  # Joint 2 limits
+            [-2.6, 2.5],  # Joint 3 limits
+            [-2*np.pi, 2*np.pi], # Joint 4 limits
+            [-100*np.pi/180, 100*np.pi/180],  # Joint 5 limits
+            [-2*np.pi, 2*np.pi]   # Joint 6 limits
+        ])
+
 def wrist1_to_base_transformation(joint_pos):
     
     theta1 = joint_pos[0]

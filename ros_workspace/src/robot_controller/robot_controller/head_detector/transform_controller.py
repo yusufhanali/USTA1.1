@@ -2,7 +2,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 
-from tf2_ros import TransformBroadcaster
+from tf2_ros import TransformBroadcaster, Buffer, TransformListener
 from geometry_msgs.msg import TransformStamped
 
 from scipy.spatial.transform import Rotation as R    
@@ -13,23 +13,49 @@ import tty
 import termios
 import threading
 
+import utilities.linear_algebra as linalg_utils
+
 class TransformController(Node):
     def __init__(self):
         super().__init__('transform_controller')
         
         self.broadcaster = TransformBroadcaster(self)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         
-        self.head_position = [0.0162, 0.0788, 0.0268]  # x, y, z
-        self.head_orientation = [-np.pi/2, -np.pi/2, 0.0] # aerial xyz
+        self.camera_frame = 'wrist_yifan_camera_link'
+        self.wrist_frame = 'wrist_3_link'
+        self.world_frame = 'world'
+        
+        self.wrist_to_world_transform = None
+        while self.wrist_to_world_transform is None:
+            try:
+                self.wrist_to_world_transform = self.tf_buffer.lookup_transform(self.world_frame, self.wrist_frame, rclpy.time.Time())
+            except Exception as e:
+                self.get_logger().info(f"Waiting for transform from {self.wrist_frame} to {self.world_frame}. Error: {e}")
+                rclpy.spin_once(self, timeout_sec=1.0)
+        
+        self.wrist_to_world_matrix = linalg_utils.transform_to_matrix(self.wrist_to_world_transform)
+        
+        
+        self.head_position = [0.0195, 0.0772, 0.0249]  # x, y, z
+        #self.relative_head_orientation = [-1.6007963, -1.5457963, 0.0868] # aerial xyz
+        self.relative_head_orientation_quat = [-0.50228551, -0.48899811, -0.48744078, 0.52056853]  # xyzw format
+        self.change_wrt_world = [0.0, 0.0, 0.0]
         
         self.stdin_fd = sys.stdin.fileno()
-        self.translation_step = 0.0005
-        self.rotation_step = 0.0002
+        self.translation_step = 0.0002
+        self.rotation_step = 0.0001
             
         self.publish_timer = self.create_timer(0.1, self.publish_tf)
 
     def publish_tf(self):
-        orientation_quat = R.from_euler('ZYZ', self.head_orientation).as_quat()  # Convert to xyzw format
+        current_orientation = R.from_quat(self.relative_head_orientation_quat).as_matrix()
+        current_orientation = self.wrist_to_world_matrix[:3, :3] @ current_orientation
+        current_orientation = R.from_euler('XYZ', self.change_wrt_world).as_matrix() @ current_orientation
+        current_orientation = self.wrist_to_world_matrix[:3, :3].T @ current_orientation
+        
+        orientation_quat = R.from_matrix(current_orientation).as_quat()  # Convert to xyzw format
         
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
@@ -44,7 +70,7 @@ class TransformController(Node):
         t.transform.rotation.w = orientation_quat[3]
         self.broadcaster.sendTransform(t)
         
-        print(f'position={self.head_position}, orientation={self.head_orientation}, orientation_quat={orientation_quat}', end='\r')  # Print on the same line
+        print(f'position={self.head_position}, orientation={self.relative_head_orientation_quat}, orientation_quat={orientation_quat}', end='\r')  # Print on the same line
         
 def read_input(self):
     while rclpy.ok():
@@ -69,17 +95,17 @@ def read_input(self):
                 elif ch == 'e':
                     self.head_position[2] += self.translation_step
                 elif ch == 'r':
-                    self.head_orientation[0] += self.rotation_step
+                    self.change_wrt_world[0] += self.rotation_step
                 elif ch == 'f':
-                    self.head_orientation[0] -= self.rotation_step
+                    self.change_wrt_world[0] -= self.rotation_step
                 elif ch == 't':
-                    self.head_orientation[1] += self.rotation_step
+                    self.change_wrt_world[1] += self.rotation_step
                 elif ch == 'g':
-                    self.head_orientation[1] -= self.rotation_step
+                    self.change_wrt_world[1] -= self.rotation_step
                 elif ch == 'y':
-                    self.head_orientation[2] += self.rotation_step
+                    self.change_wrt_world[2] += self.rotation_step
                 elif ch == 'h':
-                    self.head_orientation[2] -= self.rotation_step
+                    self.change_wrt_world[2] -= self.rotation_step
                 elif ch == 'u':
                     self.translation_step += 0.1
                 elif ch == 'j':

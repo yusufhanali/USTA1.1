@@ -221,14 +221,7 @@ class UR5eWatchdog(Node):
         return altered_velocity
        
     def joint_limit_constraint(self, commanded_velocity):
-        joint_limits = np.array([
-            [-2*np.pi, 2*np.pi],  # Joint 1 limits
-            [-3.5, 0.25],  # Joint 2 limits
-            [-2.54, 2.1],  # Joint 3 limits
-            [-2*np.pi, 2*np.pi], # Joint 4 limits
-            [-2*np.pi, (3*np.pi)/4],  # Joint 5 limits
-            [-2*np.pi, 2*np.pi]   # Joint 6 limits
-        ])
+        joint_limits = ur5e_kinematics.JOINT_LIMITS
         caution_angle = 0.15  # radians
         
         current_joint_positions = self.joint_states_global["pos"]
@@ -238,17 +231,17 @@ class UR5eWatchdog(Node):
         
         for i, command in enumerate(commanded_velocity):
             if command > 0 and commanded_joint_positions[i] > joint_limits[i][1] - caution_angle:
-                #self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds cautionary limit.")
+                #self.get_logger().info(f"Joint limit constraint activated: Joint {i} commanded position exceeds cautionary limit.")
                 if commanded_joint_positions[i] > joint_limits[i][1]:
-                    #self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds upper limit.")
+                    #self.get_logger().info(f"Joint limit constraint activated: Joint {i} commanded position exceeds upper limit.")
                     altered_velocity[i] = 0
                 else:
                     altered_velocity[i] = ((joint_limits[i][1] - (commanded_joint_positions[i])) / caution_angle) * command
                     
             elif command < 0 and commanded_joint_positions[i] < joint_limits[i][0] + caution_angle:
-                #self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds cautionary limit.")
+                #self.get_logger().info(f"Joint limit constraint activated: Joint {i} commanded position exceeds cautionary limit.")
                 if commanded_joint_positions[i] < joint_limits[i][0]:
-                    #self.get_logger().info(f"Joint limit constraint activated: Joint {i+1} commanded position exceeds lower limit.")
+                    #self.get_logger().info(f"Joint limit constraint activated: Joint {i} commanded position exceeds lower limit.")
                     altered_velocity[i] = 0
                 else:
                     altered_velocity[i] = ((commanded_joint_positions[i] - joint_limits[i][0]) / caution_angle) * command
