@@ -154,7 +154,12 @@ class BreatheAndGazeController(NewController):
                     wrist1 = 0
                 wrist1 = -wrist1 if target_in_w1_pos[0] > 0 else wrist1
                 wrist1 = geometry_utils.angular_wrap(wrist1)
-                                
+                
+                if wrist1 + self.joint_states_global["pos"][1] <= ur5e_kinematics.JOINT_LIMITS[3, 0]:
+                    wrist1 = wrist1 + 2*np.pi
+                elif wrist1 + self.joint_states_global["pos"][1] >= ur5e_kinematics.JOINT_LIMITS[3, 1]:
+                    wrist1 = wrist1 - 2*np.pi
+                                                            
                 gazing_velocities[1] = wrist1 * self.gaze_multiplier
                 total_error[1] = wrist1          
                 if abs(gazing_velocities[1]) > joint_limits[1]:
@@ -278,7 +283,7 @@ class BreatheAndGazeController(NewController):
         gaze_velocities = np.zeros(self.num_of_gazing_joints)
         
         if self.do_breathing:
-            target_distance = np.linalg.norm(self.target_in_base_position)
+            target_distance = np.linalg.norm(self.target_in_base_position[:2])
             #breathing_gazing_controller.breathe_controller.set_frequency(slope_smoother.filter(linear_slope.scale(target_distance)) if target_distance != 0 else linear_slope.min_output)
             #print(f"Target distance: {target_distance:.2f} m, Breathe frequency: {self.breathe_controller.freq:.2f} Hz", end="\r")
             forward = 0.0 if target_distance == 0 or target_distance > self.min_dist_to_target else target_distance-self.min_dist_to_target

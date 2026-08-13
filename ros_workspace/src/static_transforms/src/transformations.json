@@ -24,14 +24,25 @@
         },
         {
             "parent_frame_id": "wrist_3_link",
+            "child_frame_id": "gripper_tip",
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.1797,
+            "qx": 0.0,
+            "qy": 0.0,
+            "qz": 0.0,
+            "qw": 1.0
+        },
+        {
+            "parent_frame_id": "wrist_3_link",
             "child_frame_id": "wrist_yifan_camera_link",
-            "x": 0.0195,
-            "y": 0.0772,
-            "z": 0.0249,
-            "qx": -0.50228551,
-            "qy": -0.48899811,
-            "qz": -0.48744078,
-            "qw": 0.52056853
+            "x": 0.0147,
+            "y": 0.0784,
+            "z": 0.0271,
+            "qx": 0.49903038,
+            "qy": 0.50788387,
+            "qz": 0.49469911,
+            "qw": -0.49829253
         },
         {
             "parent_frame_id": "world",

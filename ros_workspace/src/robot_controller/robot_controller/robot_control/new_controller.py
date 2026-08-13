@@ -414,6 +414,8 @@ class NewController(Node):
         self.speed = 0.05
                 
         self.movement_stop_threshold = 0.007
+        
+        self.joint_velocity_additive_modifier = np.zeros(6)
                                                 
         # Sanity check at the end of node. If both of these are printed, then the node is probably working properly.
         self.get_logger().info('present time.')  
@@ -489,6 +491,8 @@ class NewController(Node):
     def publish_velocity_command(self, vels):
         if type(vels) is not np.ndarray:
             vels = np.array(vels)
+         
+        vels += self.joint_velocity_additive_modifier
          
         vels = self.filter_joint_velocities(vels)      
 

@@ -38,7 +38,7 @@ class TransformController(Node):
         self.wrist_to_world_matrix = linalg_utils.transform_to_matrix(self.wrist_to_world_transform)
         
         
-        self.head_position = [0.0195, 0.0772, 0.0249]  # x, y, z
+        self.head_position = [0.0147, 0.0784, 0.0271]  # x, y, z
         #self.relative_head_orientation = [-1.6007963, -1.5457963, 0.0868] # aerial xyz
         self.relative_head_orientation_quat = [-0.50228551, -0.48899811, -0.48744078, 0.52056853]  # xyzw format
         self.change_wrt_world = [0.0, 0.0, 0.0]

@@ -233,7 +233,7 @@ class UR5eWatchdog(Node):
             if command > 0 and commanded_joint_positions[i] > joint_limits[i][1] - caution_angle:
                 #self.get_logger().info(f"Joint limit constraint activated: Joint {i} commanded position exceeds cautionary limit.")
                 if commanded_joint_positions[i] > joint_limits[i][1]:
-                    #self.get_logger().info(f"Joint limit constraint activated: Joint {i} commanded position exceeds upper limit.")
+                    self.get_logger().info(f"Joint limit constraint activated: Joint {i} commanded position exceeds upper limit.")
                     altered_velocity[i] = 0
                 else:
                     altered_velocity[i] = ((joint_limits[i][1] - (commanded_joint_positions[i])) / caution_angle) * command
@@ -241,7 +241,7 @@ class UR5eWatchdog(Node):
             elif command < 0 and commanded_joint_positions[i] < joint_limits[i][0] + caution_angle:
                 #self.get_logger().info(f"Joint limit constraint activated: Joint {i} commanded position exceeds cautionary limit.")
                 if commanded_joint_positions[i] < joint_limits[i][0]:
-                    #self.get_logger().info(f"Joint limit constraint activated: Joint {i} commanded position exceeds lower limit.")
+                    self.get_logger().info(f"Joint limit constraint activated: Joint {i} commanded position exceeds lower limit.")
                     altered_velocity[i] = 0
                 else:
                     altered_velocity[i] = ((commanded_joint_positions[i] - joint_limits[i][0]) / caution_angle) * command
