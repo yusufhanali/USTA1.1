@@ -26,6 +26,7 @@ class ExperimentController(BreatheAndGazeController):
         self.clicked_event = threading.Event()
         self.clicked_event.clear()
         self.last_clicked_point_in_base = np.array([-1.0, -1.0, -1.0])
+        self.last_clicked_point_in_sent_frame = np.array([-1.0, -1.0, -1.0])
         
         while not self.tfBuffer.can_transform(self.base, "overhead_hri_camera_link", rclpy.time.Time()):
             self.init_tf()
@@ -55,6 +56,7 @@ class ExperimentController(BreatheAndGazeController):
 
     def clicked_point_callback(self, msg):
         clicked_point = np.array([msg.point.x, msg.point.y, msg.point.z, 1.0]).T
+        self.last_clicked_point_in_sent_frame = clicked_point.T[:3]
         base_frame = msg.header.frame_id
         
         self.get_logger().info(f"Received clicked point in frame '{base_frame}': ({clicked_point[0]:.3f}, {clicked_point[1]:.3f}, {clicked_point[2]:.3f})")
@@ -100,9 +102,9 @@ class ExperimentController(BreatheAndGazeController):
         target_orientation[:, 2] = target_orientation_z
         target_orientation_in_world = self.base_to_world_homogeneous[:3, :3] @ target_orientation
                
-        self.publish_arrow(start_pos=target_position_in_world, end_pos=target_position_in_world + 0.5 * target_orientation_in_world[:, 0], frame="world", id=0, color=(1.0, 0.0, 0.0, 1.0))
-        self.publish_arrow(start_pos=target_position_in_world, end_pos=target_position_in_world + 0.5 * target_orientation_in_world[:, 1], frame="world", id=1, color=(0.0, 1.0, 0.0, 1.0))
-        self.publish_arrow(start_pos=target_position_in_world, end_pos=target_position_in_world + 0.5 * target_orientation_in_world[:, 2], frame="world", id=2, color=(0.0, 0.0, 1.0, 1.0))
+        #self.publish_arrow(start_pos=target_position_in_world, end_pos=target_position_in_world + 0.5 * target_orientation_in_world[:, 0], frame="world", id=0, color=(1.0, 0.0, 0.0, 1.0))
+        #self.publish_arrow(start_pos=target_position_in_world, end_pos=target_position_in_world + 0.5 * target_orientation_in_world[:, 1], frame="world", id=1, color=(0.0, 1.0, 0.0, 1.0))
+        #self.publish_arrow(start_pos=target_position_in_world, end_pos=target_position_in_world + 0.5 * target_orientation_in_world[:, 2], frame="world", id=2, color=(0.0, 0.0, 1.0, 1.0))
         self.publish_ball(target_position_in_world, frame="world", marker_id=3, color=(1.0, 1.0, 0.0, 1.0))
         
         target_orientation_in_world = R.from_matrix(target_orientation_in_world).as_quat()  
@@ -141,7 +143,7 @@ class ExperimentController(BreatheAndGazeController):
                 total_velocities[3] = gaze_velocities[1]
                 total_velocities[4] = gaze_velocities[2]
                 
-            self.publish_velocity_command(total_velocities)
+            self.publish_velocity_command(total_velocities * 0.6)
                    
             self.ros_rate.sleep()
             
@@ -192,12 +194,12 @@ class ExperimentController(BreatheAndGazeController):
             object_orientation = R.from_matrix(object_orientation_matrix_rotated).as_quat()
         
         current_position = self.get_current_coordinate()
-        movement_direction = object_position - current_position
+        movement_direction = (object_position - current_position) * [1.0, 1.0, 0.0]  # Only consider x and y for direction
         movement_direction /= np.linalg.norm(movement_direction)
         
         self.go_to_pose_in_base_with_cubic_spline(desired_coordinate=object_position,
-                                                  start_derivative=movement_direction * 0.1,  # Example start derivative
-                                                  end_derivative=movement_direction * 0.1,  # Example end derivative
+                                                  start_derivative=movement_direction * 0.3,  # Example start derivative
+                                                  end_derivative=[0.0, 0.0, -0.2],  # Example end derivative
                                                   desired_orientation=object_orientation,
                                                   speed=speed)  # xyzw quaternion
         
@@ -206,10 +208,11 @@ class ExperimentController(BreatheAndGazeController):
     
 
 class apf_generator:
-    def __init__(self, apf_source_name: str = "", apf_constant: float = 0.01, threshold_distance: float = 0.50):
+    def __init__(self, apf_source_name: str = "", apf_constant: float = 0.01, threshold_distance: float = 0.50, max_force: float = 0.1):
         self.apf_source_name = apf_source_name
         self.apf_constant = apf_constant
         self.threshold_distance = threshold_distance
+        self.max_force = max_force
 
         self.apf_source_position_filter = cf.LinearFilter(alpha = 0.5)
         self.apf_target_position_filter = cf.LinearFilter(alpha = 0.5)
@@ -225,6 +228,7 @@ class apf_generator:
             
             if distance < self.threshold_distance:    
                 apf_force_magnitude = self.apf_constant / (distance * distance)  # F = Z / r^2
+                apf_force_magnitude = min(apf_force_magnitude, self.max_force)  # Limit the force magnitude
                 apf_force_direction = (apf_target_position_in_base - apf_source_position_in_base) / distance  # unit vector
                 apf_force = apf_force_magnitude * apf_force_direction  # F vector
 
@@ -246,7 +250,7 @@ class apf_generator:
             return np.zeros(3)
                 
 def observer(experiment_controller: ExperimentController = None, frequency: int = 30):    
-    human_apf_generator = apf_generator(apf_source_name = "rigid_body_2", apf_constant = 0.025, threshold_distance = 0.50)
+    human_apf_generator = apf_generator(apf_source_name = "rigid_body_9", apf_constant = 0.005, threshold_distance = 0.40, max_force = 1.5)
 
     while rclpy.ok():
         loop_start_time = time.time()
@@ -264,7 +268,7 @@ def observer(experiment_controller: ExperimentController = None, frequency: int 
         time.sleep(sleep_time)
          
 def machine(experiment_controller: ExperimentController = None):            
-    while rclpy.ok():
+    while rclpy.ok():        
         experiment_controller.clicked_event.wait()
         clicked_point = experiment_controller.last_clicked_point_in_base
         experiment_controller.clicked_event.clear()
@@ -291,7 +295,19 @@ def main(args=None):
         observer_thread = threading.Thread(target=observer, args=(experiment_controller, ))
         observer_thread.start()
         
-        print("Starting main.")
+        #print("Starting main.")
+        
+        #while rclpy.ok():
+        #    current_eef_velocity = experiment_controller.get_current_eef_velocity()
+        #    current_linear_velocity = current_eef_velocity[:3]
+        #    
+        #    experiment_controller.publish_arrow(start_pos=experiment_controller.get_current_coordinate(),
+        #                                       end_pos=experiment_controller.get_current_coordinate() + 2 * current_linear_velocity,
+        #                                       frame=experiment_controller.base,
+        #                                       id=10,
+        #                                       color=(0.0, 1.0, 1.0, 1.0))
+        #    
+        #    experiment_controller.ros_rate.sleep()
                    
         experiment_controller.start_controller(speed=0.15, go_home=True)  # Start the controller without going to home position
                          

@@ -62,9 +62,7 @@ class GripperController:
     def current_pos(self):        
         return self.gripper.get_current_position()
 
-
-class CubicSplineController():
-    
+class CubicSplineController():    
     def rotation_vector(self, desired_orientation):
         current_orientation = self.robot.get_current_orientation()
         desired_orientation_matrix = linalg_utils.quaternion_to_rotation_matrix(desired_orientation) if len(desired_orientation) == 4 else desired_orientation
@@ -73,7 +71,6 @@ class CubicSplineController():
         return rotvec
 
     def __init__(self, robot, start_point, end_point, start_derivative, end_derivative, desired_orientation = None, speed = 0.05, control_rate = 500):
-
         self.robot = robot
         self.start_point = start_point
         self.end_point = end_point
@@ -87,8 +84,6 @@ class CubicSplineController():
         #self.rotational_scaler = control_and_filters.WedgeShapedScaler(min_input=0.0, max_input=1.0, entry_distance=0.3, exit_distance=0.3, peak_output=10/7)
 
         self.t = 0.0
-        self.t_refresh_period = 0.01
-        self.t_refresh_threshold = self.t_refresh_period
 
         self.x_coordinate, \
         self.y_coordinate, \
@@ -107,36 +102,57 @@ class CubicSplineController():
         
         if desired_orientation is not None:
             rotvec = self.rotation_vector(desired_orientation)
-            print(f"Initial rotation vector to desired orientation: {rotvec}")
+            self.robot.get_logger().info(f"Initial rotation vector to desired orientation: {rotvec}")
             desired_rot_speed = rotvec / self.estimated_total_time
-            print(f"Initial desired rotational speed: {desired_rot_speed}")
+            self.robot.get_logger().info(f"Initial desired rotational speed: {desired_rot_speed}")
         else:
             desired_rot_speed = np.zeros(3)
         self.desired_rot_speed = desired_rot_speed
-        self.desired_rot_reached = False
-                        
-    def get_cubic_spline_equations(self):
         
-        x_coeff, y_coeff, z_coeff = geometry_utils.cubic_spline(start_pos=self.start_point, start_derivative=self.start_derivative, end_pos=self.end_point, end_derivative=self.end_derivative)
-
+        self.current_error = 0.0
+        
+        self.desired_log = [] #TODO
+        self.sent_log = []
+                        
+    def get_cubic_spline_equations(self, start_point=None, end_point=None, start_derivative=None, end_derivative=None):
+        if start_point is None:
+            start_point = self.start_point
+        if end_point is None:
+            end_point = self.end_point
+        if start_derivative is None:
+            start_derivative = self.start_derivative
+        if end_derivative is None:
+            end_derivative = self.end_derivative
+        
+        #self.robot.get_logger().info(f"Calculating cubic spline equations, start point: {start_point} - end point: {end_point} - start derivative: {start_derivative} - end derivative: {end_derivative}")
+        x_coeff, y_coeff, z_coeff = geometry_utils.cubic_spline(start_pos=start_point, start_derivative=start_derivative, end_pos=end_point, end_derivative=end_derivative)
+    
         x_coordinates = lambda t: x_coeff[0]*t**3 + x_coeff[1]*t**2 + x_coeff[2]*t + x_coeff[3]
         y_coordinates = lambda t: y_coeff[0]*t**3 + y_coeff[1]*t**2 + y_coeff[2]*t + y_coeff[3]
         z_coordinates = lambda t: z_coeff[0]*t**3 + z_coeff[1]*t**2 + z_coeff[2]*t + z_coeff[3]
-
+    
         x_derivatives = lambda t: 3*x_coeff[0]*t**2 + 2*x_coeff[1]*t + x_coeff[2]
         y_derivatives = lambda t: 3*y_coeff[0]*t**2 + 2*y_coeff[1]*t + y_coeff[2]
         z_derivatives = lambda t: 3*z_coeff[0]*t**2 + 2*z_coeff[1]*t + z_coeff[2]
-
+    
         return x_coordinates, y_coordinates, z_coordinates, x_derivatives, y_derivatives, z_derivatives
     
-    def calculate_remaining_trajectory_length(self, num_points=400):
-        
+    def calculate_remaining_trajectory_length(self, num_points=400, start_t=None, x_coordinate=None, y_coordinate=None, z_coordinate=None):
+        if start_t is None:
+            start_t = self.t
+        if x_coordinate is None:
+            x_coordinate = self.x_coordinate
+        if y_coordinate is None:
+            y_coordinate = self.y_coordinate
+        if z_coordinate is None:
+            z_coordinate = self.z_coordinate
+
         length = 0.0
-        prev_point = np.array([self.x_coordinate(self.t), self.y_coordinate(self.t), self.z_coordinate(self.t)])
+        prev_point = np.array([x_coordinate(start_t), y_coordinate(start_t), z_coordinate(start_t)])
 
         for i in range(1, num_points):
-            t = self.t + (1 - self.t) * (i / num_points)
-            curr_point = np.array([self.x_coordinate(t), self.y_coordinate(t), self.z_coordinate(t)])
+            t = start_t + (1 - start_t) * (i / num_points)
+            curr_point = np.array([x_coordinate(t), y_coordinate(t), z_coordinate(t)])
             length += np.linalg.norm(curr_point - prev_point)
             prev_point = curr_point
 
@@ -144,122 +160,110 @@ class CubicSplineController():
 
         return length
 
-    def calculate_remaining_time(self, length, speed):
-        
+    def calculate_remaining_time(self, length, speed):        
         return length / speed if speed > 0 else 5
 
-    def refresh_derivatives(self):
-        
+    def refresh_derivatives(self):        
         start_point = self.robot.get_current_coordinate()
-        end_point = self.end_point
-        start_derivative = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
-        end_derivative = self.end_derivative
-        #self.robot.get_logger().info(f"Refreshing derivatives, start point: {start_point} - end point: {end_point} - start derivative: {start_derivative} - end derivative: {end_derivative}")
+        eef_velocity = self.robot.get_current_eef_velocity()
+        start_derivative = np.array([eef_velocity[0], eef_velocity[1], eef_velocity[2]])
         
-        output_vector_x = np.array([start_point[0], start_derivative[0], end_point[0], end_derivative[0]])
-        output_vector_y = np.array([start_point[1], start_derivative[1], end_point[1], end_derivative[1]])
-        output_vector_z = np.array([start_point[2], start_derivative[2], end_point[2], end_derivative[2]])
-                
-        guessed_remaining_time = (1 - self.t) * self.estimated_total_time
-        actual_remaining_time = self.calculate_remaining_time(self.calculate_remaining_trajectory_length(), self.speed)
-        time_diff = actual_remaining_time - guessed_remaining_time
-        #self.robot.get_logger().info(f"time necessary to reach end from current t(guess): {guessed_remaining_time}")
-        #self.robot.get_logger().info(f"time necessary to reach end from current t(actual): {actual_remaining_time}")
-        self.estimated_total_time += time_diff
-        scaled_time_adjustment = time_diff / self.estimated_total_time
-        self.t -= scaled_time_adjustment
-                
-        current_values = np.zeros((4, 4))
-        current_values[0] = np.array([self.t**3, self.t**2, self.t, 1])
-        current_values[1] = np.array([3*self.t**2, 2*self.t, 1, 0])
-        current_values[2] = np.array([1, 1, 1, 1])
-        current_values[3] = np.array([3, 2, 1, 0])
-
-        coeff_matrix = np.linalg.inv(current_values)
+        here_to_end_equations = self.get_cubic_spline_equations(start_point=start_point, end_point=self.end_point, start_derivative=start_derivative, end_derivative=self.end_derivative)
+        self.robot.publish_marker_array(self.trajectory_MarkerArray(t=0.0 ,x_coordinate=here_to_end_equations[0], y_coordinate=here_to_end_equations[1], z_coordinate=here_to_end_equations[2], color=(1.0, 0.0, 0.0, 1.0), id_offset=600, draw_fully=True))
+                     
+        self.t = 0.0
+                                
+        self.x_coordinate = here_to_end_equations[0]
+        self.y_coordinate = here_to_end_equations[1]
+        self.z_coordinate = here_to_end_equations[2]
         
-        x_coeff = coeff_matrix @ output_vector_x
-        y_coeff = coeff_matrix @ output_vector_y
-        z_coeff = coeff_matrix @ output_vector_z
-                
-        self.x_coordinate = lambda t: x_coeff[0]*t**3 + x_coeff[1]*t**2 + x_coeff[2]*t + x_coeff[3]
-        self.y_coordinate = lambda t: y_coeff[0]*t**3 + y_coeff[1]*t**2 + y_coeff[2]*t + y_coeff[3]
-        self.z_coordinate = lambda t: z_coeff[0]*t**3 + z_coeff[1]*t**2 + z_coeff[2]*t + z_coeff[3]
-        self.robot.publish_marker_array(self.trajectory_MarkerArray())
-                
-        #x_coeff, y_coeff, z_coeff = three_point_cubic_spline(start_pos=start_point, start_derivative=start_derivative, end_derivative=end_derivative, end_pos=end_point)
-        #THIS IS WRONG, DO NOT USE THE ABOVE LINE
+        self.x_derivative = here_to_end_equations[3]
+        self.y_derivative = here_to_end_equations[4]
+        self.z_derivative = here_to_end_equations[5]
         
-        self.x_derivative = lambda t: 3*x_coeff[0]*t**2 + 2*x_coeff[1]*t + x_coeff[2]
-        self.y_derivative = lambda t: 3*y_coeff[0]*t**2 + 2*y_coeff[1]*t + y_coeff[2]
-        self.z_derivative = lambda t: 3*z_coeff[0]*t**2 + 2*z_coeff[1]*t + z_coeff[2]
-        
-        if not self.desired_rot_reached and self.desired_orientation is not None:
+        if self.desired_orientation is not None:
             rotvec = self.rotation_vector(self.desired_orientation)
-            desired_rot_speed = rotvec / actual_remaining_time
+            desired_rot_speed = rotvec / self.estimated_total_time
             self.desired_rot_speed = desired_rot_speed
         
-    def get_cubic_velocities(self, speed_multiplier = 1.0):
-        
-        if not self.desired_rot_reached and self.desired_orientation is not None:
+    def get_cubic_velocities(self, speed_multiplier = 1.0, max_error = 0.005):        
+        if self.desired_orientation is not None:
             rotvec = self.rotation_vector(self.desired_orientation)
             rotation_error_norm = np.linalg.norm(rotvec)
             if rotation_error_norm < 0.005:
                 self.desired_rot_speed = np.zeros(3)
-                self.desired_rot_reached = True
-                self.robot.get_logger().info("Desired rotation reached.")
-                
-        if self.t > self.t_refresh_threshold:
-            #self.robot.get_logger().info("Refreshing derivatives.")
-            self.refresh_derivatives()
-            self.t_refresh_threshold += self.t_refresh_period
+                #self.robot.get_logger().info("Desired rotation reached.")
         
-        trajectory_desired = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
-        desired_linear_speed = (trajectory_desired / np.linalg.norm(trajectory_desired)) * self.speed
+        safety_multiplier = 1.0
+                       
+        if self.current_error > max_error:
+            self.robot.get_logger().info(f"Current Coordinate: {self.robot.get_current_coordinate()} - Desired Coordinate: {[self.x_coordinate(self.t), self.y_coordinate(self.t), self.z_coordinate(self.t)]} - Current Error: {self.current_error} - t: {self.t}")
+            self.refresh_derivatives()
+            safety_multiplier = 0.5
+                    
+        velocity_desired = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
+        self.desired_log.append(np.concatenate([velocity_desired, np.array([np.linalg.norm(velocity_desired)])]))
+
+        desired_linear_speed = (velocity_desired / np.linalg.norm(velocity_desired)) * self.speed
+        
         desired_speed = np.concatenate((desired_linear_speed, self.desired_rot_speed))
+        
         desired_speed[:3] *= self.linear_scaler.scale(self.t) + (1 - self.linear_scaler.peak_output)
         #desired_speed[3:] *= self.rotational_scaler.scale(self.t)
-        desired_speed *= speed_multiplier
+        desired_speed *= speed_multiplier * safety_multiplier
+        self.sent_log.append(np.concatenate([desired_speed[:3], np.array([np.linalg.norm(desired_speed[:3]), np.linalg.norm(velocity_desired)])]))
         
         curr_speed = np.linalg.norm(desired_speed[:3])
         
         #self.robot.get_logger().info(f"norm_of_desired_linear_speed: {np.linalg.norm(desired_speed[:3])} - speed_multiplier: {speed_multiplier} - t: {self.t}")
-        
-        self.t += (curr_speed) / (self.trajectory_length * self.control_rate)
-        
+                
+        self.current_error = np.linalg.norm(self.robot.get_current_coordinate() - np.array([self.x_coordinate(self.t), self.y_coordinate(self.t), self.z_coordinate(self.t)])) 
+        self.t += (curr_speed) / (np.linalg.norm(velocity_desired) * self.control_rate)
+                
         return desired_speed
     
-    def trajectory_MarkerArray(self, num_points=200):        
+    def trajectory_MarkerArray(self, num_points=200, t=None, x_coordinate=None, y_coordinate=None, z_coordinate=None, color=(1.0, 1.0, 0.0, 1.0), id_offset=0, draw_fully=False):
+        if x_coordinate is None:
+            x_coordinate = self.x_coordinate
+        if y_coordinate is None:
+            y_coordinate = self.y_coordinate
+        if z_coordinate is None:
+            z_coordinate = self.z_coordinate
+        if t is None:
+            t = self.t
+                
         marker_array = MarkerArray()
         num_points_max = num_points
-        num_points = int((1-self.t) * num_points) if self.t < 1 else num_points
+        if not draw_fully:
+            num_points = int((1-t) * num_points) if t < 1 else num_points
         counter = 0
         for i in range(num_points_max-num_points):
             dummy_marker = Marker()
             dummy_marker.action = Marker.DELETE
             dummy_marker.header.frame_id = self.robot.base
             dummy_marker.ns = "trajectory"
-            dummy_marker.id = counter
+            dummy_marker.id = counter + id_offset
             counter += 1
             marker_array.markers.append(dummy_marker)
-        for i in np.linspace(self.t, 1, num_points):
+        for i in np.linspace(t, 1, num_points):
             point_marker = Marker()
             point_marker.header.frame_id = self.robot.base
             #point_marker.header.stamp = self.robot.get_clock().now().to_msg()
             point_marker.ns = "trajectory"
-            point_marker.id = counter
+            point_marker.id = counter + id_offset
             counter += 1
             point_marker.type = Marker.SPHERE
             point_marker.action = Marker.ADD
             point_marker.scale.x = 0.01  # Diameter in x
             point_marker.scale.y = 0.01  # Diameter in y
             point_marker.scale.z = 0.01  # Diameter in z
-            point_marker.color.r = 1.0
-            point_marker.color.g = 1.0
-            point_marker.color.b = 0.0
-            point_marker.color.a = 1.0
+            point_marker.color.r = color[0]
+            point_marker.color.g = color[1]
+            point_marker.color.b = color[2]
+            point_marker.color.a = color[3]
 
             # Set the ball position
-            point_marker.pose.position = Point(x=self.x_coordinate(i), y=self.y_coordinate(i), z=self.z_coordinate(i))
+            point_marker.pose.position = Point(x=x_coordinate(i), y=y_coordinate(i), z=z_coordinate(i))
             point_marker.pose.orientation.w = 1.0  # No rotation
 
             marker_array.markers.append(point_marker)
@@ -304,7 +308,7 @@ class CubicSplineController():
             marker_array.markers.append(arrow_marker)
         
         return marker_array
-    
+
 
 class NewController(Node):
 
@@ -445,6 +449,14 @@ class NewController(Node):
         except:
             self.get_logger().info(f"Error in getting current coordinate: {traceback.format_exc()}")
         return current_coordinate
+
+    def get_current_eef_velocity(self):
+        current_velocity = np.zeros(6)        
+        try:
+            current_velocity = self.get_jacobian_matrix() @ self.joint_states_global["vels"]
+        except:
+            self.get_logger().error(f"Error in getting current eef velocity: {traceback.format_exc()}")
+        return current_velocity
 
     def get_current_orientation(self):
         orientation = ur5e_kinematics.get_ee_orientation(self.joint_states_global["pos"])
@@ -651,7 +663,7 @@ class NewController(Node):
         
         return cubic_spline_controller
 
-    def go_to_pose_in_base_with_cubic_spline(self, desired_coordinate=None, start_derivative=None, end_derivative=None, desired_orientation=None, speed=None):
+    def go_to_pose_in_base_with_cubic_spline(self, desired_coordinate=None, start_derivative=None, end_derivative=None, desired_orientation=None, speed=None, max_error=0.005):
         if speed is None:
             speed = self.speed
 
@@ -662,10 +674,10 @@ class NewController(Node):
             end_derivative=end_derivative,
             desired_orientation=desired_orientation,
             speed=speed
-        ) 
-            
-        while rclpy.ok() and cubic_spline_controller.t < 1.0:
-            
+        )
+        
+        current_error = np.linalg.norm(desired_coordinate - self.get_current_coordinate())           
+        while rclpy.ok() and current_error > max_error and cubic_spline_controller.t < 1.0:            
             velocity_command = cubic_spline_controller.get_cubic_velocities()
             
             current_coordinate = self.get_current_coordinate()
@@ -676,12 +688,26 @@ class NewController(Node):
             
             self.publish_velocity_command(velocity_command) 
             
+            current_error = np.linalg.norm(desired_coordinate - self.get_current_coordinate())
             self.ros_rate.sleep()
-            
             
         self.stop_movement()
         self.get_logger().info(f"Current t: {cubic_spline_controller.t} Current position: {self.get_current_coordinate()} - Desired position: {desired_coordinate}")
         self.get_logger().info(f"Error: {np.linalg.norm(desired_coordinate - self.get_current_coordinate())}")
+                
+        plt.figure()
+        plt.plot(np.array(cubic_spline_controller.desired_log))
+        plt.title("Desired Velocities Over Time")
+        plt.legend(["X Velocity", "Y Velocity", "Z Velocity", "Norm of Desired Linear Velocity"])
+        plt.xlabel("Time Step")
+        plt.ylabel("Desired Velocity (m/s)")
+        plt.figure()
+        plt.plot(np.array(cubic_spline_controller.sent_log))
+        plt.title("Sent Velocities Over Time")
+        plt.legend(["X Velocity", "Y Velocity", "Z Velocity", "Norm of Sent Linear Velocity", "Norm of Sampled Linear Velocity"])
+        plt.xlabel("Time Step")
+        plt.ylabel("Sent Velocity (m/s)")
+        plt.show(block=True)
         
         
     def publish_marker(self, marker):
@@ -744,6 +770,32 @@ class NewController(Node):
 
         # Publish the ball marker
         self.publish_marker(ball_marker)
+ 
+    def publish_marker_array_from_points(self, points, marker_type=Marker.SPHERE, radius=0.01, frame="base", color=(1.0, 0.0, 0.0, 1.0)):
+        marker_array = MarkerArray()
+        for i, point in enumerate(points):
+            marker = Marker()
+            marker.header.frame_id = frame
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = "points"
+            marker.id = i
+            marker.type = marker_type
+            marker.action = Marker.ADD
+            marker.scale.x = radius * 2  # Diameter in x
+            marker.scale.y = radius * 2  # Diameter in y
+            marker.scale.z = radius * 2  # Diameter in z
+            marker.color.r = color[0]
+            marker.color.g = color[1]
+            marker.color.b = color[2]
+            marker.color.a = color[3]
+
+            # Set the ball position
+            marker.pose.position = Point(x=point[0], y=point[1], z=point[2])
+            marker.pose.orientation.w = 1.0  # No rotation
+
+            marker_array.markers.append(marker)
+
+        self.publish_marker_array(marker_array) 
  
     def prepare_log_plots(self):
         self.figure_index = 0

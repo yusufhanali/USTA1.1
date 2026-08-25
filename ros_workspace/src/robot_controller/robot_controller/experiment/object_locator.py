@@ -135,7 +135,6 @@ class ObjectLocatorNode(Node):
             
 
 def main(args=None):
-
     try:
         rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)    
         object_locator = ObjectLocatorNode()

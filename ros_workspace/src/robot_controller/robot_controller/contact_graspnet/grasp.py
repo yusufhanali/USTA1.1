@@ -94,8 +94,8 @@ class GraspNode(Node):
             z = structured_cloud['z']
 
             mask = (
-                (x >= -0.15) & (x <= 0.15) &
-                (y >= -0.10) & (y <= 0.20)
+                (x >= -0.12) & (x <= 0.12) &
+                (y >= -0.07) & (y <= 0.17)
                 )
 
             cropped_structured_cloud = structured_cloud[mask]
@@ -137,7 +137,7 @@ class GraspNode(Node):
         
         grasp_position = grasp_pose[:3, 3] + grasp_pcd_offset
         #grasp_position -= grasp_orientation @ np.array([0, 0, 0.055]) # No need, changed the eefo position to the tip of the gripper, so the offset is already accounted for in the grasp_pose.
-        grasp_position += grasp_orientation @ np.array([0, 0, 0.13]) # Add the offset to the grasp position to account for the gripper's length and models learned position offset
+        grasp_position += grasp_orientation @ np.array([0, 0, 0.14]) # Add the offset to the grasp position to account for the gripper's length and models learned position offset
                         
         grasp_pose = np.concatenate((grasp_position, grasp_orientation_quat))
                         
@@ -169,21 +169,21 @@ class GraspNode(Node):
         
     def run_cgn_inference(self, point_cloud):
         try:
-            pred_grasps, pred_success, downsample = cgn_utils.cgn_infer(self.cgn, point_cloud, obj_mask=None, threshold=0.9)
+            pred_grasps, pred_success, downsample = cgn_utils.cgn_infer(self.cgn, point_cloud, obj_mask=None, threshold=0.5)
             self.get_logger().info(f"CGN inference completed. Number of grasps found: {pred_grasps.shape[0]}")
             return pred_grasps, pred_success, downsample
         except Exception as e:
             self.get_logger().error(f"Error during CGN inference: {traceback.format_exc()}")
             return None, None, None
 
-    def get_and_publish_grasp_pose(self, max_tries=5):
+    def get_and_publish_grasp_pose(self, max_tries=10):
         tries = 0
         point_cloud, centroid = self.point_cloud_data
         while rclpy.ok() and tries < max_tries:
             pred_grasps, _, _ = self.run_cgn_inference(point_cloud)
             tries += 1
             
-            if pred_grasps is not None and pred_grasps.shape[0] > 0:
+            if pred_grasps is not None and pred_grasps.shape[0] > 0:                
                 grasp_pose = pred_grasps[0]
                 self.publish_grasp_pose(grasp_pose, centroid)
                 return grasp_pose

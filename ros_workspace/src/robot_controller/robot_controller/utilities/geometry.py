@@ -66,8 +66,8 @@ def cubic_spline(start_pos=None, end_pos=None, start_derivative=None, end_deriva
     
     p0 = start_pos
     p1 = end_pos
-    r0 = start_derivative / np.linalg.norm(start_derivative)
-    r1 = end_derivative / np.linalg.norm(end_derivative)
+    r0 = start_derivative
+    r1 = end_derivative
     
     p0x, p0y, p0z = p0[0], p0[1], p0[2]
     p1x, p1y, p1z = p1[0], p1[1], p1[2]

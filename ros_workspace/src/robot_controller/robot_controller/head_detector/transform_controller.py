@@ -23,8 +23,8 @@ class TransformController(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
-        self.camera_frame = 'wrist_yifan_camera_link'
-        self.wrist_frame = 'wrist_3_link'
+        self.camera_frame = 'overhead_hri_camera_link'
+        self.wrist_frame = 'world'
         self.world_frame = 'world'
         
         self.wrist_to_world_transform = None
@@ -38,9 +38,9 @@ class TransformController(Node):
         self.wrist_to_world_matrix = linalg_utils.transform_to_matrix(self.wrist_to_world_transform)
         
         
-        self.head_position = [0.0147, 0.0784, 0.0271]  # x, y, z
+        self.head_position = [0.8822, -1.489, 2.2328,]  # x, y, z
         #self.relative_head_orientation = [-1.6007963, -1.5457963, 0.0868] # aerial xyz
-        self.relative_head_orientation_quat = [-0.50228551, -0.48899811, -0.48744078, 0.52056853]  # xyzw format
+        self.relative_head_orientation_quat = [-0.26430327, 0.27674969, 0.65393444, 0.65262787]  # xyzw format
         self.change_wrt_world = [0.0, 0.0, 0.0]
         
         self.stdin_fd = sys.stdin.fileno()
@@ -51,16 +51,16 @@ class TransformController(Node):
 
     def publish_tf(self):
         current_orientation = R.from_quat(self.relative_head_orientation_quat).as_matrix()
-        current_orientation = self.wrist_to_world_matrix[:3, :3] @ current_orientation
+        #current_orientation = self.wrist_to_world_matrix[:3, :3] @ current_orientation
         current_orientation = R.from_euler('XYZ', self.change_wrt_world).as_matrix() @ current_orientation
-        current_orientation = self.wrist_to_world_matrix[:3, :3].T @ current_orientation
+        #current_orientation = self.wrist_to_world_matrix[:3, :3].T @ current_orientation
         
         orientation_quat = R.from_matrix(current_orientation).as_quat()  # Convert to xyzw format
         
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'wrist_3_link'
-        t.child_frame_id = 'wrist_yifan_camera_link'
+        t.header.frame_id = 'world'
+        t.child_frame_id = 'overhead_hri_camera_link'
         t.transform.translation.x = self.head_position[0]
         t.transform.translation.y = self.head_position[1]
         t.transform.translation.z = self.head_position[2]
