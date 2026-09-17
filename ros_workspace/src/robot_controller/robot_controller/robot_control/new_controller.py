@@ -80,10 +80,13 @@ class CubicSplineController():
         self.speed = speed if speed < 0.8 else 0.8
         self.control_rate = control_rate  # Hz
 
-        self.linear_scaler = control_and_filters.WedgeShapedScaler(min_input=0.0, max_input=1.0, entry_distance=0.15 + self.speed/4, exit_distance=0.2 + self.speed/4, peak_output=0.5 + self.speed/2)
-        #self.rotational_scaler = control_and_filters.WedgeShapedScaler(min_input=0.0, max_input=1.0, entry_distance=0.3, exit_distance=0.3, peak_output=10/7)
+        self.slow_start_threshold = 0.1
+        self.slow_end_threshold = 0.1
 
         self.t = 0.0
+
+        self.tick_counter = 0
+        self.slow_calculation_tick_threshold = 25
 
         self.x_coordinate, \
         self.y_coordinate, \
@@ -92,10 +95,10 @@ class CubicSplineController():
         self.y_derivative, \
         self.z_derivative = self.get_cubic_spline_equations()
         self.robot.publish_marker_array(self.trajectory_MarkerArray())
-        #self.robot.publish_marker_array(self.derivatives_MarkerArray())
         
-        self.trajectory_length = self.calculate_remaining_trajectory_length()
-        
+        self.trajectory_length = self.calculate_curve_length()
+        self.distance_traveled = 0.0
+                
         self.initial_time_estimate = self.calculate_remaining_time(self.trajectory_length, self.speed)
         self.estimated_total_time = self.initial_time_estimate
         self.robot.get_logger().info(f"Estimated time to complete trajectory: {self.estimated_total_time}")
@@ -103,16 +106,14 @@ class CubicSplineController():
         if desired_orientation is not None:
             rotvec = self.rotation_vector(desired_orientation)
             self.robot.get_logger().info(f"Initial rotation vector to desired orientation: {rotvec}")
-            desired_rot_speed = rotvec / self.estimated_total_time
+            desired_rot_speed = rotvec / (self.estimated_total_time * 0.8)  # 0.8 is a safety factor to ensure we reach the desired orientation in time
             self.robot.get_logger().info(f"Initial desired rotational speed: {desired_rot_speed}")
         else:
             desired_rot_speed = np.zeros(3)
         self.desired_rot_speed = desired_rot_speed
+        self.rotation_reached = False
         
         self.current_error = 0.0
-        
-        self.desired_log = [] #TODO
-        self.sent_log = []
                         
     def get_cubic_spline_equations(self, start_point=None, end_point=None, start_derivative=None, end_derivative=None):
         if start_point is None:
@@ -156,21 +157,70 @@ class CubicSplineController():
             length += np.linalg.norm(curr_point - prev_point)
             prev_point = curr_point
 
-        #self.robot.get_logger().info(f"Calculated remaining trajectory length: {length}")
+        return length
+
+    def calculate_curve_length(self, start_t=0.0, end_t=1.0, x_derivative=None, y_derivative=None, z_derivative=None):
+        """
+            Works faster than calculate_remaining_trajectory_length
+        """
+        if x_derivative is None:
+            x_derivative = self.x_derivative
+        if y_derivative is None:
+            y_derivative = self.y_derivative
+        if z_derivative is None:
+            z_derivative = self.z_derivative
+
+        length = 0.0
+        
+        t = start_t
+        
+        while t < end_t:
+            dt = 0.001
+            if t + dt > end_t:
+                dt = end_t - t
+            
+            dx = x_derivative(t) * dt
+            dy = y_derivative(t) * dt
+            dz = z_derivative(t) * dt
+            
+            length += np.sqrt(dx**2 + dy**2 + dz**2)
+            
+            t += dt
 
         return length
 
-    def calculate_remaining_time(self, length, speed):        
+    def calculate_remaining_time(self, length, speed = None):
+        if speed is None:
+            speed = self.speed
+        
         return length / speed if speed > 0 else 5
 
     def refresh_derivatives(self):        
         start_point = self.robot.get_current_coordinate()
+
+        remaining_distance = np.linalg.norm(self.end_point - start_point)        
         eef_velocity = self.robot.get_current_eef_velocity()
-        start_derivative = np.array([eef_velocity[0], eef_velocity[1], eef_velocity[2]])
+        current_speed = np.linalg.norm(eef_velocity)
+        if current_speed > 1e-6:
+            tangent_magnitude = remaining_distance * 1.5 
+            start_derivative = (eef_velocity / current_speed) * tangent_magnitude
+        else:
+            start_derivative = np.zeros(3)
+            
+        end_deriv_norm = np.linalg.norm(self.end_derivative)
+        if end_deriv_norm > 1e-6:
+            safe_end_derivative = (self.end_derivative / end_deriv_norm) * (remaining_distance * 1.5)
+        else:
+            safe_end_derivative = np.zeros(3)
         
-        here_to_end_equations = self.get_cubic_spline_equations(start_point=start_point, end_point=self.end_point, start_derivative=start_derivative, end_derivative=self.end_derivative)
+        here_to_end_equations = self.get_cubic_spline_equations(
+            start_point=start_point, 
+            end_point=self.end_point, 
+            start_derivative=start_derivative, 
+            end_derivative=safe_end_derivative
+        )
         self.robot.publish_marker_array(self.trajectory_MarkerArray(t=0.0 ,x_coordinate=here_to_end_equations[0], y_coordinate=here_to_end_equations[1], z_coordinate=here_to_end_equations[2], color=(1.0, 0.0, 0.0, 1.0), id_offset=600, draw_fully=True))
-                     
+                
         self.t = 0.0
                                 
         self.x_coordinate = here_to_end_equations[0]
@@ -181,44 +231,51 @@ class CubicSplineController():
         self.y_derivative = here_to_end_equations[4]
         self.z_derivative = here_to_end_equations[5]
         
-        if self.desired_orientation is not None:
-            rotvec = self.rotation_vector(self.desired_orientation)
-            desired_rot_speed = rotvec / self.estimated_total_time
-            self.desired_rot_speed = desired_rot_speed
-        
-    def get_cubic_velocities(self, speed_multiplier = 1.0, max_error = 0.005):        
-        if self.desired_orientation is not None:
-            rotvec = self.rotation_vector(self.desired_orientation)
-            rotation_error_norm = np.linalg.norm(rotvec)
-            if rotation_error_norm < 0.005:
-                self.desired_rot_speed = np.zeros(3)
-                #self.robot.get_logger().info("Desired rotation reached.")
-        
-        safety_multiplier = 1.0
-                       
-        if self.current_error > max_error:
-            self.robot.get_logger().info(f"Current Coordinate: {self.robot.get_current_coordinate()} - Desired Coordinate: {[self.x_coordinate(self.t), self.y_coordinate(self.t), self.z_coordinate(self.t)]} - Current Error: {self.current_error} - t: {self.t}")
-            self.refresh_derivatives()
-            safety_multiplier = 0.5
+    def get_cubic_velocities(self, speed_multiplier = 1.0, max_error = 0.001):
+        if self.t >= 1.0:
+            return np.zeros(6)
+           
+        # For time consuming checks and calculations
+        if self.tick_counter % self.slow_calculation_tick_threshold == 0:           
+            if not self.rotation_reached and self.desired_orientation is not None:
+                rotvec = self.rotation_vector(self.desired_orientation)
+                rotation_error_norm = np.linalg.norm(rotvec)
+                if rotation_error_norm < 0.005:
+                    self.desired_rot_speed = np.zeros(3)
+                    self.robot.get_logger().info("Desired rotation reached.")
+                    self.rotation_reached = True
                     
+            if self.current_error > max_error and self.t > 0.5 and self.t < 0.95:
+                self.refresh_derivatives()
+              
         velocity_desired = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
-        self.desired_log.append(np.concatenate([velocity_desired, np.array([np.linalg.norm(velocity_desired)])]))
+        param_derivative_norm = np.linalg.norm(velocity_desired)
+        
+        if param_derivative_norm < 1e-5:
+            self.t = 1.0
+            return np.zeros(6)
 
         desired_linear_speed = (velocity_desired / np.linalg.norm(velocity_desired)) * self.speed
+        linear_speed_scale = 1.0
+        remaining_length = max(self.trajectory_length - self.distance_traveled, 0.0)
+        if self.distance_traveled < self.slow_start_threshold:
+            linear_speed_scale = max((self.distance_traveled / self.slow_start_threshold), 0.4)
+        if remaining_length < self.slow_end_threshold:
+            linear_speed_scale = max((remaining_length / self.slow_end_threshold), 0.4)
+            
+        desired_linear_speed *= linear_speed_scale
         
         desired_speed = np.concatenate((desired_linear_speed, self.desired_rot_speed))
-        
-        desired_speed[:3] *= self.linear_scaler.scale(self.t) + (1 - self.linear_scaler.peak_output)
-        #desired_speed[3:] *= self.rotational_scaler.scale(self.t)
-        desired_speed *= speed_multiplier * safety_multiplier
-        self.sent_log.append(np.concatenate([desired_speed[:3], np.array([np.linalg.norm(desired_speed[:3]), np.linalg.norm(velocity_desired)])]))
+        desired_speed *= speed_multiplier
         
         curr_speed = np.linalg.norm(desired_speed[:3])
-        
-        #self.robot.get_logger().info(f"norm_of_desired_linear_speed: {np.linalg.norm(desired_speed[:3])} - speed_multiplier: {speed_multiplier} - t: {self.t}")
-                
+        self.distance_traveled += curr_speed / self.control_rate
+                        
         self.current_error = np.linalg.norm(self.robot.get_current_coordinate() - np.array([self.x_coordinate(self.t), self.y_coordinate(self.t), self.z_coordinate(self.t)])) 
         self.t += (curr_speed) / (np.linalg.norm(velocity_desired) * self.control_rate)
+        self.t = min(self.t, 1.0)
+        
+        self.tick_counter += 1
                 
         return desired_speed
     
@@ -399,9 +456,11 @@ class NewController(Node):
             [-0.7071068, -0.7071068, 0.0, 0.0955],
             [0.0, 0.0, 1.0, 0.7347],
             [0.0, 0.0, 0.0, 1.0]
-        ])
+        ])        
+        self.base_to_world_3x3 = self.base_to_world_homogeneous[:3, :3]
         
         self.world_to_base_homogeneous = linalg_utils.reverse_homogeneous_matrix(self.base_to_world_homogeneous)
+        self.world_to_base_3x3 = self.world_to_base_homogeneous[:3, :3]        
         
         self.base_to_x_towards_board = linalg_utils.rot_z_matrix(np.pi/4)
         self.x_towards_board_to_base = linalg_utils.rot_z_matrix(-np.pi/4)
@@ -409,7 +468,7 @@ class NewController(Node):
         self.first_movement = True        
         self.prev_velocities = np.zeros(6)
         
-        self.home_pos = np.array([-0.8, -1.73, -2.1,  1.1,  1.52,  3.16])
+        self.home_pos = np.array([-0.8, -1.73, -2.1,  1.1,  1.52, -np.pi])
         self.gripper_length = 0.17
         
         self.marker_array_publisher = self.create_publisher(MarkerArray, "vis_marker_array", 10)
@@ -477,7 +536,6 @@ class NewController(Node):
         return invj
         
     def filter_joint_velocities(self, joint_velocities):
-
         if self.first_movement:
             self.prev_velocities = joint_velocities
             self.first_movement = False
@@ -541,9 +599,17 @@ class NewController(Node):
         self.gripper.open(speed, force)
         self.get_logger().info("Gripper opened.")
         
+    def open_gripper_async(self, speed=255, force=255):
+        self.gripper.open_async(speed, force)
+        self.get_logger().info("Gripper opening asynchronously.")
+        
     def close_gripper(self, speed=255, force=255):
         self.gripper.close(speed, force)
         self.get_logger().info("Gripper closed.")
+        
+    def close_gripper_async(self, speed=255, force=255):
+        self.gripper.close_async(speed, force)
+        self.get_logger().info("Gripper closing asynchronously.")
         
     def move_gripper(self, pos, speed=255, force=255):
         self.gripper.move_gripper(pos, speed, force)
@@ -583,6 +649,7 @@ class NewController(Node):
     def go_to_home_pos(self, speed=None):
         if speed is None:
             speed = self.speed
+            
         self.go_to_joint_pos(self.home_pos, speed=speed)
     
     def rotation_vector(self, desired_orientation):
@@ -663,7 +730,7 @@ class NewController(Node):
         
         return cubic_spline_controller
 
-    def go_to_pose_in_base_with_cubic_spline(self, desired_coordinate=None, start_derivative=None, end_derivative=None, desired_orientation=None, speed=None, max_error=0.005):
+    def go_to_pose_in_base_with_cubic_spline(self, desired_coordinate=None, start_derivative=None, end_derivative=None, desired_orientation=None, speed=None, max_error=0.001):
         if speed is None:
             speed = self.speed
 
@@ -680,9 +747,6 @@ class NewController(Node):
         while rclpy.ok() and current_error > max_error and cubic_spline_controller.t < 1.0:            
             velocity_command = cubic_spline_controller.get_cubic_velocities()
             
-            current_coordinate = self.get_current_coordinate()
-            self.publish_arrow(current_coordinate, current_coordinate + velocity_command[:3])
-
             pinv_jacobian = self.get_inverse_jacobian()
             velocity_command = pinv_jacobian @ velocity_command
             
@@ -694,20 +758,6 @@ class NewController(Node):
         self.stop_movement()
         self.get_logger().info(f"Current t: {cubic_spline_controller.t} Current position: {self.get_current_coordinate()} - Desired position: {desired_coordinate}")
         self.get_logger().info(f"Error: {np.linalg.norm(desired_coordinate - self.get_current_coordinate())}")
-                
-        plt.figure()
-        plt.plot(np.array(cubic_spline_controller.desired_log))
-        plt.title("Desired Velocities Over Time")
-        plt.legend(["X Velocity", "Y Velocity", "Z Velocity", "Norm of Desired Linear Velocity"])
-        plt.xlabel("Time Step")
-        plt.ylabel("Desired Velocity (m/s)")
-        plt.figure()
-        plt.plot(np.array(cubic_spline_controller.sent_log))
-        plt.title("Sent Velocities Over Time")
-        plt.legend(["X Velocity", "Y Velocity", "Z Velocity", "Norm of Sent Linear Velocity", "Norm of Sampled Linear Velocity"])
-        plt.xlabel("Time Step")
-        plt.ylabel("Sent Velocity (m/s)")
-        plt.show(block=True)
         
         
     def publish_marker(self, marker):

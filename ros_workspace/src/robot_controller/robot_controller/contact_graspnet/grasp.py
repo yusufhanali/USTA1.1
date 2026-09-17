@@ -95,7 +95,8 @@ class GraspNode(Node):
 
             mask = (
                 (x >= -0.12) & (x <= 0.12) &
-                (y >= -0.07) & (y <= 0.17)
+                (y >= -0.07) & (y <= 0.17) &
+                (z >= 0.0) & (z <= 1.0)
                 )
 
             cropped_structured_cloud = structured_cloud[mask]

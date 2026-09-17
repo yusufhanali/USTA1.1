@@ -56,8 +56,6 @@ class BreatheAndGazeController(NewController):
         self.do_breathing = do_breathing
         self.do_gazing = do_gazing
         
-        self.home_pos = np.array([-0.8, -1.73, -1.8,  0.5,  1.52,  3.16])
-
     def init_log_buffers(self):        
         super().init_log_buffers()
 
@@ -73,7 +71,7 @@ class BreatheAndGazeController(NewController):
         try:
             self.breathing_task = np.zeros(3)
             self.target_in_base_position = np.zeros(3)
-            self.min_dist_to_target = 1.5
+            self.min_dist_to_target = 1.0
             self.linear_slope = control_and_filters_utils.LinearScaler(1, 1.7, 0.2, 0.5)
             self.slope_smoother = control_and_filters_utils.LinearFilter(alpha=0.1)
             self.forward_smoother = control_and_filters_utils.LinearFilter(alpha=0.3)

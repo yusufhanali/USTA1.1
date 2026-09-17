@@ -125,5 +125,15 @@ def three_point_cubic_spline(start_pos=None, start_derivative=None, mid0_pos=Non
     
     return x_coefficients, y_coefficients, z_coefficients
 
+def point_to_line_distance(P, A, B):
+    """Distance from Point P to 3D line segment AB."""
+    v = B - A
+    u = P - A
+    v_sq = np.dot(v, v)
+    if v_sq < 1e-8:
+        return np.linalg.norm(P - A)
+    t = np.clip(np.dot(u, v) / v_sq, 0.0, 1.0)
+    return np.linalg.norm(P - (A + t * v))
+
 def angular_wrap(angle):
     return (angle + np.pi) % (2 * np.pi) - np.pi

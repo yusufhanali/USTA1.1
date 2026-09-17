@@ -15,6 +15,16 @@ JOINT_LIMITS = np.array([
             [-2*np.pi, 2*np.pi]   # Joint 6 limits
         ])
 
+# Standard UR5e DH parameters: [d, a, alpha]
+DH_PARAMS = [
+    [0.1625,  0.0,     np.pi/2],   # Joint 1: Base -> Shoulder
+    [0.0,    -0.425,   0.0],       # Joint 2: Shoulder -> Elbow (Upper Arm)
+    [0.0,    -0.3922,  0.0],       # Joint 3: Elbow -> Wrist 1 (Forearm)
+    [0.1333,  0.0,     np.pi/2],   # Joint 4: Wrist 1 -> Wrist 2
+    [0.0997,  0.0,    -np.pi/2],   # Joint 5: Wrist 2 -> Wrist 3
+    [0.0996,  0.0,     0.0]        # Joint 6: Wrist 3 -> Flange
+]
+
 def wrist1_to_base_transformation(joint_pos):
     
     theta1 = joint_pos[0]
@@ -268,6 +278,24 @@ def get_ee_transformation(joint_pos):
     eef_to_base[3,3] = 1
     
     return eef_to_base
+
+def get_link_transforms(joint_pos):
+    """Computes cumulative link frames."""
+    T = np.eye(4)
+    transforms = [T]
+    for i, (d, a, alpha) in enumerate(DH_PARAMS):
+        theta = joint_pos[i]
+        ct, st = np.cos(theta), np.sin(theta)
+        ca, sa = np.cos(alpha), np.sin(alpha)
+        dh_matrix = np.array([
+            [ct, -st*ca,  st*sa, a*ct],
+            [st,  ct*ca, -ct*sa, a*st],
+            [0,   sa,     ca,    d],
+            [0,   0,      0,     1]
+        ])
+        T = T @ dh_matrix
+        transforms.append(T)
+    return transforms
 
 def get_inverse_ee_transformation(joint_pos): #This is without gripper
     

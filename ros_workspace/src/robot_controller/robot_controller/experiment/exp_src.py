@@ -44,13 +44,18 @@ class ExperimentController(BreatheAndGazeController):
         self.grasp_event.clear()
         self.grasp_pose = np.array([-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0])
         self.grasp_pose_subscriber = self.create_subscription(Float32MultiArray, "/grasp_pose", self.grasp_pose_callback, 10)
-            
+    
+    def init_interaction_stuff(self):        
+        self.handover_orientation = np.array([0.8001031, 0.3314136, 0.1913417, 0.4619398])
+        self.handover_position = np.array([0.4, -0.6, 0.5])
+    
     def __init__(self, name = "experiment_controller"):
         super().__init__(name)
         
         self.camera_towards_board_quat = np.array(la.rotation_matrix_to_quaternion((la.rot_x_homogeneous_matrix(np.pi) @ la.rot_z_homogeneous_matrix(-np.pi/4))[:3, :3]))
         
         self.init_clicked_point_stuff()
+        self.init_interaction_stuff()
         
         self.get_logger().info("ExperimentController initialized.")
 
@@ -61,11 +66,8 @@ class ExperimentController(BreatheAndGazeController):
         
         self.get_logger().info(f"Received clicked point in frame '{base_frame}': ({clicked_point[0]:.3f}, {clicked_point[1]:.3f}, {clicked_point[2]:.3f})")
         
-        if base_frame == "overhead_hri_camera_link":
-            to_base_matrix = self.hri_overhead_to_base_matrix
-        else:
-            to_base_matrix = self.tfBuffer.lookup_transform(self.base, base_frame, rclpy.time.Time())
-            to_base_matrix = la.tf_transform_to_homogeneous_matrix(to_base_matrix.transform)
+        to_base_matrix = self.tfBuffer.lookup_transform(self.base, base_frame, rclpy.time.Time())
+        to_base_matrix = la.tf_transform_to_homogeneous_matrix(to_base_matrix.transform)
             
         clicked_point_in_base = to_base_matrix @ clicked_point
         clicked_point_in_base = clicked_point_in_base[:3]
@@ -110,13 +112,38 @@ class ExperimentController(BreatheAndGazeController):
         target_orientation_in_world = R.from_matrix(target_orientation_in_world).as_quat()  
     
         return target_position_in_world, target_orientation_in_world
+
+    def create_dropoff_frame(self, dropoff_position_in_base):  
+        dropoff_position_in_world = self.base_to_world_homogeneous @ np.array([dropoff_position_in_base[0], dropoff_position_in_base[1], dropoff_position_in_base[2], 1.0]).T
+        dropoff_position_in_world = dropoff_position_in_world[:3]
+               
+        dropoff_orientation_z = np.array([0.0, 0.0, -1.0])
+        dropoff_orientation_y = dropoff_position_in_base/np.linalg.norm(dropoff_position_in_base)
+        dropoff_orientation_x = np.cross(dropoff_orientation_y, dropoff_orientation_z)
+        dropoff_orientation_x /= np.linalg.norm(dropoff_orientation_x)
+        dropoff_orientation_y = np.cross(dropoff_orientation_z, dropoff_orientation_x)
+        dropoff_orientation_y /= np.linalg.norm(dropoff_orientation_y)
+        
+        dropoff_orientation = np.eye(3)
+        dropoff_orientation[:, 0] = dropoff_orientation_x
+        dropoff_orientation[:, 1] = dropoff_orientation_y
+        dropoff_orientation[:, 2] = dropoff_orientation_z
+        dropoff_orientation_in_world = self.base_to_world_homogeneous[:3, :3] @ dropoff_orientation
+               
+        #self.publish_arrow(start_pos=dropoff_position_in_world, end_pos=dropoff_position_in_world + 0.5 * dropoff_orientation_in_world[:, 0], frame="world", id=4, color=(1.0, 0.0, 0.0, 1.0))
+        #self.publish_arrow(start_pos=dropoff_position_in_world, end_pos=dropoff_position_in_world + 0.5 * dropoff_orientation_in_world[:, 1], frame="world", id=5, color=(0.0, 1.0, 0.0, 1.0))
+        #self.publish_arrow(start_pos=dropoff_position_in_world, end_pos=dropoff_position_in_world + 0.5 * dropoff_orientation_in_world[:, 2], frame="world", id=6, color=(0.0, 0.0, 1.0, 1.0))
+        
+        dropoff_orientation_in_world = R.from_matrix(dropoff_orientation_in_world).as_quat()
+        
+        return dropoff_position_in_world, dropoff_orientation_in_world
     
     def gaze_at_object(self, object_position_in_base):
         gaze_velocities = np.ones(4)
             
         target_position_in_world, target_orientation_in_world = self.create_object_frame(object_position_in_base)
                 
-        set_joint_positions = np.array([0.0, -np.pi/2, -np.pi/2, -np.pi*3/8, 0.0, np.pi])
+        set_joint_positions = np.array([0.0, -np.pi/2, -np.pi/2, -np.pi*3/8, 0.0, -np.pi])
         total_error = np.ones(4)
         gaze_takeover = False
         set_velocity_coefficient = 0.8
@@ -160,7 +187,10 @@ class ExperimentController(BreatheAndGazeController):
     def object_to_pick_up(self):
         return np.array([0.5, 0.0, 0.1])  # Example object position in base frame
     
-    def pick_up_object(self, object_pose=None, speed=0.1):
+    def pick_up_object(self, object_pose=None, speed=None):
+        if speed is None:
+            speed = self.speed
+        
         self.open_gripper()
         
         if object_pose is None:
@@ -206,6 +236,53 @@ class ExperimentController(BreatheAndGazeController):
         self.close_gripper()
         self.get_logger().info("Picked up the object.")
     
+    def place_object(self, recepticle_position=np.array([-0.3, 0.3, 0.2]), speed=None):
+        if speed is None:
+            speed = self.speed
+        
+        _, dropoff_orientation = self.create_dropoff_frame(recepticle_position)        
+        dropoff_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(dropoff_orientation).as_matrix()).as_quat()
+        
+        self.go_to_pose_in_base_with_cubic_spline(desired_coordinate=recepticle_position,
+                                                  start_derivative=[0.0, 0.0, 0.2],
+                                                  end_derivative=[0.0, 0.0, -0.2],
+                                                  desired_orientation=dropoff_orientation,
+                                                  speed=speed)
+        self.open_gripper()
+        self.get_logger().info("Placed the object.")
+
+    def hand_object_over(self, handover_position=None, handover_orientation=None, speed=None):
+        if speed is None:
+            speed = self.speed
+        if handover_position is None:
+            handover_position = self.handover_position
+        if handover_orientation is None:
+            handover_orientation = self.handover_orientation
+        
+        eef_position = self.get_current_coordinate()
+        eef_position[2] = 0.0
+        eef_position /= np.linalg.norm(eef_position)
+        
+        left_vector = np.array([1.0, 1.0, 0.0])
+        up_sign = 1.0
+        if np.dot(eef_position, left_vector) < 0:
+            up_sign = -1.0
+        
+        up_vector = np.array([0.0, 0.0, 1.0 * up_sign])
+        tangent_to_the_base_circle = np.cross(eef_position, up_vector)
+        tangent_to_the_base_circle /= np.linalg.norm(tangent_to_the_base_circle)
+        tangent_to_the_base_circle *= 3
+        tangent_to_the_base_circle[2] = 2.0
+                
+        self.go_to_pose_in_base_with_cubic_spline(desired_coordinate=handover_position,
+                                                  start_derivative=tangent_to_the_base_circle,
+                                                  end_derivative=left_vector * -0.1 * up_sign,
+                                                  desired_orientation=handover_orientation,
+                                                  speed=speed)
+        self.open_gripper()
+        self.get_logger().info("Handed over the object.")
+        
+        self.close_gripper_async()
 
 class apf_generator:
     def __init__(self, apf_source_name: str = "", apf_constant: float = 0.01, threshold_distance: float = 0.50, max_force: float = 0.1):
@@ -267,21 +344,28 @@ def observer(experiment_controller: ExperimentController = None, frequency: int 
         sleep_time = max(0, (1.0 / frequency) - elapsed_time)
         time.sleep(sleep_time)
          
-def machine(experiment_controller: ExperimentController = None):            
-    while rclpy.ok():        
-        experiment_controller.clicked_event.wait()
-        clicked_point = experiment_controller.last_clicked_point_in_base
-        experiment_controller.clicked_event.clear()
-        
-        experiment_controller.gaze_at_object(clicked_point)
-        
-        experiment_controller.grasp_event.wait()
-        experiment_controller.grasp_event.clear()
-        
-        if not experiment_controller.grasp_pose.any() or np.all(experiment_controller.grasp_pose == -1.0):
-            experiment_controller.get_logger().error("No valid grasp pose found.")
-        else:
-            experiment_controller.pick_up_object(experiment_controller.grasp_pose)
+def machine(experiment_controller: ExperimentController = None):    
+    while rclpy.ok():
+        if experiment_controller.clicked_event.is_set():
+            experiment_controller.clicked_event.wait()
+            clicked_point = experiment_controller.last_clicked_point_in_base
+            experiment_controller.clicked_event.clear()
+            
+            experiment_controller.gaze_at_object(clicked_point)
+            
+            experiment_controller.grasp_event.wait()
+            experiment_controller.grasp_event.clear()
+            
+            if not experiment_controller.grasp_pose.any() or np.all(experiment_controller.grasp_pose == -1.0):
+                experiment_controller.get_logger().error("No valid grasp pose found.")
+            else:
+                experiment_controller.pick_up_object(experiment_controller.grasp_pose)
+                
+                experiment_controller.hand_object_over()
+        else:            
+            breathe_and_gaze_velocities = experiment_controller.breathe_and_gaze_step()
+            experiment_controller.publish_velocity_command(breathe_and_gaze_velocities)
+            experiment_controller.ros_rate.sleep()
     
     
 def main(args=None):
@@ -295,21 +379,9 @@ def main(args=None):
         observer_thread = threading.Thread(target=observer, args=(experiment_controller, ))
         observer_thread.start()
         
-        #print("Starting main.")
-        
-        #while rclpy.ok():
-        #    current_eef_velocity = experiment_controller.get_current_eef_velocity()
-        #    current_linear_velocity = current_eef_velocity[:3]
-        #    
-        #    experiment_controller.publish_arrow(start_pos=experiment_controller.get_current_coordinate(),
-        #                                       end_pos=experiment_controller.get_current_coordinate() + 2 * current_linear_velocity,
-        #                                       frame=experiment_controller.base,
-        #                                       id=10,
-        #                                       color=(0.0, 1.0, 1.0, 1.0))
-        #    
-        #    experiment_controller.ros_rate.sleep()
+        print("Starting main.")
                    
-        experiment_controller.start_controller(speed=0.15, go_home=True)  # Start the controller without going to home position
+        experiment_controller.start_controller(speed=0.2, go_home=True)  # Start the controller without going to home position
                          
         machine(experiment_controller)
         

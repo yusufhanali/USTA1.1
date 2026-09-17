@@ -56,8 +56,6 @@ class neo_mimic(NewController):
         self.do_breathing = do_breathing
         self.do_gazing = do_gazing
         
-        self.home_pos = np.array([-0.8, -1.73, -1.8,  0.5,  1.52,  3.16])
-
         self.delay = 0.0
         self.start_time = time.time()
 

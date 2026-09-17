@@ -98,27 +98,31 @@ class LinearScaler:
             return ((value - self.min_input) / (self.input_range)) * (self.output_range) + self.min_output
     
 class WedgeShapedScaler:
-    def __init__(self, min_input=0.0, max_input=1.0, entry_distance=0.2, exit_distance=0.2, peak_output=1.0):
+    def __init__(self, min_input=0.0, max_input=1.0, entry_distance=0.2, exit_distance=0.2, peak_output=1.0, min_output=0.0):
         self.min_input = min_input
         self.max_input = max_input
         self.entry_distance = entry_distance
         self.exit_distance = exit_distance
         self.peak_output = peak_output
+        self.min_output = min_output
         self.plateau_start = min_input + entry_distance
         self.plateau_end = max_input - exit_distance
 
     def scale(self, value):
+        return_value = self.min_output
         if value < self.min_input:
-            return 0.0
+            return self.min_output
         elif value > self.max_input:
-            return 0.0
-        elif value <= self.plateau_start:
-            return ((value - self.min_input) / (self.plateau_start - self.min_input)) * self.peak_output
+            return self.min_output
+        elif value < self.plateau_start:
+            return_value = ((value - self.min_input) / (self.plateau_start - self.min_input)) * self.peak_output
         elif value <= self.plateau_end:
-            return self.peak_output
+            return_value = self.peak_output
         else:
-            return ((self.max_input - value) / (self.max_input - self.plateau_end)) * self.peak_output
+            return_value = ((self.max_input - value) / (self.max_input - self.plateau_end)) * self.peak_output
         
+        return max(self.min_output, min(self.peak_output, return_value))
+
 def visualize_scaler(scaler, num_points=100):
     import matplotlib.pyplot as plt
 

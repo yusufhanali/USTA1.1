@@ -81,6 +81,14 @@ class UR5eWatchdog(Node):
                 else:
                     rclpy.spin_once(self)
 
+    def init_camera_parameters(self):
+        self.camera_position = self.tfBuffer.lookup_transform("wrist_3_link", "wrist_yifan_camera_link", rclpy.time.Time()).transform.translation
+        # lens is offset from the camera's geometrical center at the x axis by +17.5 mm
+        self.camera_position.x -= 0.0175   
+
+    def init_temp_stuff(self):
+        pass
+    
     def __init__(self, name = "ur5e_watchdog"):
         super().__init__(name)
         
@@ -100,6 +108,9 @@ class UR5eWatchdog(Node):
         self.init_joint_states()        
         self.init_velocity_controller()        
         self.init_tf()
+        self.init_camera_parameters()
+        
+        self.init_temp_stuff()
         
         self.base_to_world_homogeneous = np.array([ # WAS THIS WRONG BEFORE??? THE SIGNS ARE OPPOSITE NOW, LOOK INTO IT
             [-0.7071068, 0.7071068, 0.0, 1.7513],
@@ -110,7 +121,6 @@ class UR5eWatchdog(Node):
         
         self.world_to_base_homogeneous = linalg_utils.reverse_homogeneous_matrix(self.base_to_world_homogeneous)
         
-        self.first_movement = True        
         self.prev_velocities = np.zeros(6)
                         
         self.constraint_functions = []  # List to hold registered constraint functions
@@ -186,6 +196,7 @@ class UR5eWatchdog(Node):
         '''
         #self.constraint_functions.append(self.height_constraint)
         self.constraint_functions.append(self.joint_limit_constraint)
+        self.constraint_functions.append(self.camera_collision_constraint)
         
     def height_constraint(self, commanded_velocity):
         max_z = 0.85
@@ -247,7 +258,94 @@ class UR5eWatchdog(Node):
                     altered_velocity[i] = ((commanded_joint_positions[i] - joint_limits[i][0]) / caution_angle) * command
                     
         return altered_velocity
-                    
+               
+    def camera_collision_constraint(self, commanded_velocity):
+        # Thresholds (meters)
+        d_min = 0.015       # Safety boundary (1.5 cm)
+        d_caution = 0.035   # Deceleration buffer (3.5 cm)
+        
+        # Link collision radii
+        R_upper_arm = 0.065
+        R_forearm = 0.055
+        R_cam = 0.035
+        
+        current_q = self.joint_states_global["pos"]
+        
+        # Camera sample points on wrist_3_link
+        cam_local_points = np.array([
+            [self.camera_position.x - 0.035, self.camera_position.y, self.camera_position.z, 1.0],  # Left
+            [self.camera_position.x,         self.camera_position.y, self.camera_position.z, 1.0],  # Center
+            [self.camera_position.x + 0.035, self.camera_position.y, self.camera_position.z, 1.0],  # Right
+        ])
+        
+        def calc_min_clearance(q_val):            
+            tfs = ur5e_kinematics.get_link_transforms(q_val)
+            P_shoulder = tfs[1][:3, 3]
+            P_elbow = tfs[2][:3, 3]
+            P_wrist1 = tfs[3][:3, 3]
+            
+            min_d = float('inf')
+            for pt in cam_local_points:
+                P_cam = (tfs[6] @ pt)[:3]
+
+                d_forearm = geometry_utils.point_to_line_distance(P_cam, P_elbow, P_wrist1) - (R_forearm + R_cam)
+                d_upper = geometry_utils.point_to_line_distance(P_cam, P_shoulder, P_elbow) - (R_upper_arm + R_cam)
+                d_table = (P_cam[2] - 0.00) - R_cam  # Table at z = 0.00
+                
+                min_d = min(min_d, d_forearm, d_upper, d_table)
+            return min_d
+
+        def calc_clearance_gradient(q_val, d0, eps=1e-4):
+            grad = np.zeros(6)
+            for i in range(6):
+                q_step = np.copy(q_val)
+                q_step[i] += eps
+                grad[i] = (calc_min_clearance(q_step) - d0) / eps
+            return grad
+
+        curr_dist = calc_min_clearance(current_q)
+
+        # If well clear of the caution zone, pass command straight through
+        if curr_dist >= d_min + d_caution:
+            return commanded_velocity
+
+        # Compute normal direction pointing AWAY from obstacle
+        grad = calc_clearance_gradient(current_q, curr_dist)
+        grad_norm = np.linalg.norm(grad)
+        if grad_norm < 1e-6:
+            return commanded_velocity
+        n = grad / grad_norm
+
+        # Decompose commanded velocity into normal and tangential components
+        v_n = np.dot(commanded_velocity, n)
+        q_dot_tan = commanded_velocity - v_n * n  # Motion parallel to obstacle surface
+
+        # -----------------------------------------------------------------
+        # Modulate ONLY the normal component (continuous without step jumps)
+        # -----------------------------------------------------------------
+        if v_n > 0:
+            # Commanded velocity is moving AWAY from the obstacle
+            if curr_dist <= d_min:
+                # If below margin, ensure retreat speed is at least the push-out speed
+                v_push = np.clip(0.04 + 3.0 * (d_min - curr_dist), 0.04, 0.15)
+                v_n_safe = max(v_n, v_push)
+            else:
+                v_n_safe = v_n
+        else:
+            # Commanded velocity is moving TOWARD the obstacle
+            if curr_dist <= d_min:
+                # Cancel inward velocity and apply smooth proportional push-out
+                v_n_safe = np.clip(0.04 + 3.0 * (d_min - curr_dist), 0.04, 0.15)
+            else:
+                # Inside caution zone: smoothly attenuate inward component to 0 at d_min
+                scale = (curr_dist - d_min) / d_caution
+                # Quadratic scaling for gentle deceleration
+                v_n_safe = (scale ** 2) * v_n
+
+        # Recombine preserved tangential motion with safe normal motion
+        altered_velocity = q_dot_tan + v_n_safe * n
+        return altered_velocity
+
 
     def publish_velocity_command(self, vels):
         if type(vels) is not np.ndarray:
@@ -261,7 +359,6 @@ class UR5eWatchdog(Node):
         vel_msg = Float64MultiArray()
         vel_msg.data = np.array([0, 0, 0, 0, 0, 0])
         self.velocityControllerPub.publish(vel_msg)
-        self.first_movement = True
         self.get_logger().info("Movement stopped.")
     
     def shutdown_controller(self):
