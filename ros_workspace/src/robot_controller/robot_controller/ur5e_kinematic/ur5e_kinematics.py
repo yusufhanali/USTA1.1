@@ -12,7 +12,16 @@ JOINT_LIMITS = np.array([
             [-2.6, 2.5],  # Joint 3 limits
             [-2*np.pi, 2*np.pi], # Joint 4 limits
             [-140*np.pi/180, 140*np.pi/180],  # Joint 5 limits
-            [-2*np.pi, 2*np.pi]   # Joint 6 limits
+            [-2*np.pi + 0.05, 2*np.pi - 0.05]   # Joint 6 limits
+        ])
+
+JOINT_VELOCITY_LIMITS = np.array([
+            3,  # Joint 1 velocity limits
+            3,  # Joint 2 velocity limits
+            3,  # Joint 3 velocity limits
+            3,  # Joint 4 velocity limits
+            3,  # Joint 5 velocity limits
+            3   # Joint 6 velocity limits
         ])
 
 # Standard UR5e DH parameters: [d, a, alpha]

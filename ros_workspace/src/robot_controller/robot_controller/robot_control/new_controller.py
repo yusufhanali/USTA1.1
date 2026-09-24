@@ -104,16 +104,21 @@ class CubicSplineController():
         self.robot.get_logger().info(f"Estimated time to complete trajectory: {self.estimated_total_time}")
         
         if desired_orientation is not None:
-            rotvec = self.rotation_vector(desired_orientation)
-            self.robot.get_logger().info(f"Initial rotation vector to desired orientation: {rotvec}")
-            desired_rot_speed = rotvec / (self.estimated_total_time * 0.8)  # 0.8 is a safety factor to ensure we reach the desired orientation in time
-            self.robot.get_logger().info(f"Initial desired rotational speed: {desired_rot_speed}")
+            desired_rot_speed = self.get_rotation_speed(desired_orientation, self.estimated_total_time)
         else:
             desired_rot_speed = np.zeros(3)
         self.desired_rot_speed = desired_rot_speed
         self.rotation_reached = False
         
         self.current_error = 0.0
+
+    def get_rotation_speed(self, desired_orientation, remaining_time):
+        rotvec = self.rotation_vector(desired_orientation)
+        if remaining_time > 0:
+            desired_rot_speed = rotvec / (remaining_time * 0.9)  # 0.9 is a safety factor to ensure we reach the desired orientation in time
+        else:
+            desired_rot_speed = np.zeros(3)
+        return desired_rot_speed
                         
     def get_cubic_spline_equations(self, start_point=None, end_point=None, start_derivative=None, end_derivative=None):
         if start_point is None:
@@ -244,6 +249,11 @@ class CubicSplineController():
                     self.desired_rot_speed = np.zeros(3)
                     self.robot.get_logger().info("Desired rotation reached.")
                     self.rotation_reached = True
+                else:
+                    remaining_time = self.calculate_remaining_time(self.calculate_remaining_trajectory_length())
+                    self.desired_rot_speed = rotvec / (remaining_time * 0.9)
+                    self.robot.get_logger().info(f"Rotation error norm: {rotation_error_norm}, remaining time: {remaining_time}, updated desired rotational speed: {self.desired_rot_speed}")
+                    self.rotation_reached = False
                     
             if self.current_error > max_error and self.t > 0.5 and self.t < 0.95:
                 self.refresh_derivatives()
@@ -458,6 +468,7 @@ class NewController(Node):
             [0.0, 0.0, 0.0, 1.0]
         ])        
         self.base_to_world_3x3 = self.base_to_world_homogeneous[:3, :3]
+        self.base_position_in_world = self.base_to_world_homogeneous[:3, 3]
         
         self.world_to_base_homogeneous = linalg_utils.reverse_homogeneous_matrix(self.base_to_world_homogeneous)
         self.world_to_base_3x3 = self.world_to_base_homogeneous[:3, :3]        

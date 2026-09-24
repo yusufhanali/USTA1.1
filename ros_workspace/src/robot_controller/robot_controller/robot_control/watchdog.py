@@ -18,6 +18,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 
+from robot_control.new_controller import spin_thread
 from .robotiq_gripper import RobotiqGripper as robotiq_gripper
 import ur5e_kinematic.ur5e_kinematics as ur5e_kinematics
 import utilities.linear_algebra as linalg_utils
@@ -97,7 +98,7 @@ class UR5eWatchdog(Node):
         
         # Initialize control rate
         self.control_rate = 500 # Hz
-        #self.ros_rate = self.create_rate(self.control_rate, self.get_clock())
+        self.ros_rate = self.create_rate(self.control_rate, self.get_clock())
         
         self.base = "base"
         self.eef = "wrist_3_link"
@@ -122,13 +123,13 @@ class UR5eWatchdog(Node):
         self.world_to_base_homogeneous = linalg_utils.reverse_homogeneous_matrix(self.base_to_world_homogeneous)
         
         self.prev_velocities = np.zeros(6)
+        self.current_velocity_command = np.zeros(6)
                         
         self.constraint_functions = []  # List to hold registered constraint functions
         self.constraint_register()  # Call the method to register constraints
                                                                         
         # Sanity check at the end of node. If both of these are printed, then the node is probably working properly.
-        self.get_logger().info('but again, when ever is')  
-
+        self.get_logger().info('but again, when ever is')
 
     def joint_state_callback(self, msg):
         # Why does UR5e always send joint states in an order other than 012345? It was 210345 in ROS1 and now this.
@@ -157,10 +158,7 @@ class UR5eWatchdog(Node):
     def velocity_command_receiver_callback(self, msg):
         vels = np.array(msg.data)
         
-        for constraint_func in self.constraint_functions:
-            vels = constraint_func(vels)
-            
-        self.publish_velocity_command(vels)
+        self.current_velocity_command = vels
 
 
     def get_current_coordinate(self):
@@ -195,6 +193,7 @@ class UR5eWatchdog(Node):
             Use this function to register all the constraints that you want to apply to the robot. This function is called in the constructor of the class.
         '''
         #self.constraint_functions.append(self.height_constraint)
+        self.constraint_functions.append(self.joint_velocity_constraint)
         self.constraint_functions.append(self.joint_limit_constraint)
         self.constraint_functions.append(self.camera_collision_constraint)
         
@@ -229,6 +228,16 @@ class UR5eWatchdog(Node):
             return commanded_velocity
         
         altered_velocity = self.get_inverse_jacobian() @ cartesian_velocity
+        return altered_velocity
+       
+    def joint_velocity_constraint(self, commanded_velocity):
+        altered_velocity = np.copy(commanded_velocity)
+        
+        for i, command in enumerate(commanded_velocity):
+            if abs(command) > ur5e_kinematics.JOINT_VELOCITY_LIMITS[i]:
+                self.get_logger().info(f"Joint velocity constraint activated: Joint {i} commanded velocity ({command}) exceeds limit ({ur5e_kinematics.JOINT_VELOCITY_LIMITS[i]}).")
+                altered_velocity[i] = np.sign(command) * ur5e_kinematics.JOINT_VELOCITY_LIMITS[i]
+                
         return altered_velocity
        
     def joint_limit_constraint(self, commanded_velocity):
@@ -347,6 +356,21 @@ class UR5eWatchdog(Node):
         return altered_velocity
 
 
+    def loop(self):
+        self.get_logger().info("Watchdog loop started.")
+
+        while rclpy.ok():            
+            self.constrain_and_publish_velocity_command(self.current_velocity_command.copy())
+
+            self.ros_rate.sleep()
+
+
+    def constrain_and_publish_velocity_command(self, vels):
+        for constraint_func in self.constraint_functions:
+            vels = constraint_func(vels)
+            
+        self.publish_velocity_command(vels)
+
     def publish_velocity_command(self, vels):
         if type(vels) is not np.ndarray:
             vels = np.array(vels)
@@ -369,13 +393,15 @@ class UR5eWatchdog(Node):
         self.destroy_node()
 
 
-
 def main(args=None):
     try:
         rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)    
         watchdog = UR5eWatchdog()
         
-        rclpy.spin(watchdog)        
+        watchdog_spin_thread = threading.Thread(target=spin_thread, args=(watchdog,))
+        watchdog_spin_thread.start()
+        
+        watchdog.loop()      
 
     except KeyboardInterrupt:
         watchdog.stop_movement()
@@ -387,5 +413,6 @@ def main(args=None):
     watchdog.shutdown_controller()
     
     rclpy.try_shutdown()
+    watchdog_spin_thread.join()
     
     print("\n I will take care of yourself, but you do too \n")

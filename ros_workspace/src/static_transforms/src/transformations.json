@@ -47,8 +47,8 @@
         {
             "parent_frame_id": "world",
             "child_frame_id": "overhead_hri_camera_link",
-            "x": 0.8822,
-            "y": -1.489,
+            "x": 0.8506,
+            "y": -1.4575,
             "z": 2.2328,
             "qx": -0.26430327,
             "qy": 0.27674969,

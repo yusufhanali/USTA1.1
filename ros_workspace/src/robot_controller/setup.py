@@ -30,9 +30,10 @@ setup(
             'transform_controller = robot_controller.head_detector.transform_controller:main',
             'head_mimic = robot_controller.experiment.head_mimic:main',
             'neo_mimic = robot_controller.experiment.neo_mimic:main',
-            'experiment_controller = robot_controller.experiment.exp_src:main',
+            'experiment_graspnet = robot_controller.experiment.exp_src_graspnet:main',
             'grasp_manager = robot_controller.contact_graspnet.grasp:main',
             'object_locator = robot_controller.experiment.object_locator:main',
+            'experiment_optitrack = robot_controller.experiment.exp_src_optitrack:main',
         ],
     },
 )

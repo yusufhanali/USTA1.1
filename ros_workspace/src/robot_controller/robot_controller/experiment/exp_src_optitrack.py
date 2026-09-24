@@ -3,6 +3,7 @@ import threading
 import time
 import traceback
 import os
+import numpy as np
 
 import rclpy
 from rclpy.signals import SignalHandlerOptions
@@ -20,31 +21,6 @@ import utilities.control_and_filters as cf
 
 
 class ExperimentController(BreatheAndGazeController):
-    def init_clicked_point_stuff(self):
-        self.clicked_point_subscriber = self.create_subscription(PointStamped, "/clicked_point_coordinates", self.clicked_point_callback, 10)
-        
-        self.clicked_event = threading.Event()
-        self.clicked_event.clear()
-        self.last_clicked_point_in_base = np.array([-1.0, -1.0, -1.0])
-        self.last_clicked_point_in_sent_frame = np.array([-1.0, -1.0, -1.0])
-        
-        while not self.tfBuffer.can_transform(self.base, "overhead_hri_camera_link", rclpy.time.Time()):
-            self.init_tf()
-        while rclpy.ok():
-            try:
-                self.hri_overhead_to_base_matrix = self.tfBuffer.lookup_transform(self.base, "overhead_hri_camera_link", rclpy.time.Time())
-                self.hri_overhead_to_base_matrix = la.tf_transform_to_homogeneous_matrix(self.hri_overhead_to_base_matrix.transform)
-                break
-            except:
-                pass
-            
-        self.grasp_signal_publisher = self.create_publisher(Bool, "/grasp_signal", 10)
-        
-        self.grasp_event = threading.Event()
-        self.grasp_event.clear()
-        self.grasp_pose = np.array([-1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0])
-        self.grasp_pose_subscriber = self.create_subscription(Float32MultiArray, "/grasp_pose", self.grasp_pose_callback, 10)
-    
     def init_interaction_stuff(self):        
         self.handover_orientation = np.array([0.8001031, 0.3314136, 0.1913417, 0.4619398])
         self.handover_position = np.array([0.4, -0.6, 0.5])
@@ -54,100 +30,96 @@ class ExperimentController(BreatheAndGazeController):
         
         self.camera_towards_board_quat = np.array(la.rotation_matrix_to_quaternion((la.rot_x_homogeneous_matrix(np.pi) @ la.rot_z_homogeneous_matrix(-np.pi/4))[:3, :3]))
         
-        self.init_clicked_point_stuff()
         self.init_interaction_stuff()
         
         self.get_logger().info("ExperimentController initialized.")
-
-    def clicked_point_callback(self, msg):
-        clicked_point = np.array([msg.point.x, msg.point.y, msg.point.z, 1.0]).T
-        self.last_clicked_point_in_sent_frame = clicked_point.T[:3]
-        base_frame = msg.header.frame_id
-        
-        self.get_logger().info(f"Received clicked point in frame '{base_frame}': ({clicked_point[0]:.3f}, {clicked_point[1]:.3f}, {clicked_point[2]:.3f})")
-        
-        to_base_matrix = self.tfBuffer.lookup_transform(self.base, base_frame, rclpy.time.Time())
-        to_base_matrix = la.tf_transform_to_homogeneous_matrix(to_base_matrix.transform)
-            
-        clicked_point_in_base = to_base_matrix @ clicked_point
-        clicked_point_in_base = clicked_point_in_base[:3]
-        
-        self.last_clicked_point_in_base = clicked_point_in_base
-        self.clicked_event.set()
-        
-        self.publish_ball(clicked_point_in_base, frame=self.base)
-        
-    def grasp_pose_callback(self, msg):
-        if len(msg.data) != 7:
-            self.get_logger().error(f"Received grasp pose with incorrect length: {len(msg.data)}. Expected 7 (xyz + xyzw).")
-            return
-        
-        self.get_logger().info(f"Received grasp pose: {msg.data}")
-        self.grasp_pose = np.array(msg.data)  
-        self.grasp_event.set() 
-
-        
-    def create_object_frame(self, object_position_in_base):  
-        target_position_in_world = self.base_to_world_homogeneous @ np.array([object_position_in_base[0], object_position_in_base[1], object_position_in_base[2], 1.0]).T
-        target_position_in_world = target_position_in_world[:3]
-        
-        target_orientation_y = np.array([0.0, 0.0, 1.0])
-        target_orientation_x = -(object_position_in_base)/np.linalg.norm(object_position_in_base)
-        target_orientation_z = np.cross(target_orientation_x, target_orientation_y)
-        target_orientation_y = np.cross(target_orientation_z, target_orientation_x)
-        target_orientation_y /= np.linalg.norm(target_orientation_y)
-        target_orientation_z /= np.linalg.norm(target_orientation_z)
-        
-        target_orientation = np.eye(3)
-        target_orientation[:, 0] = target_orientation_x
-        target_orientation[:, 1] = target_orientation_y
-        target_orientation[:, 2] = target_orientation_z
-        target_orientation_in_world = self.base_to_world_homogeneous[:3, :3] @ target_orientation
-               
-        #self.publish_arrow(start_pos=target_position_in_world, end_pos=target_position_in_world + 0.5 * target_orientation_in_world[:, 0], frame="world", id=0, color=(1.0, 0.0, 0.0, 1.0))
-        #self.publish_arrow(start_pos=target_position_in_world, end_pos=target_position_in_world + 0.5 * target_orientation_in_world[:, 1], frame="world", id=1, color=(0.0, 1.0, 0.0, 1.0))
-        #self.publish_arrow(start_pos=target_position_in_world, end_pos=target_position_in_world + 0.5 * target_orientation_in_world[:, 2], frame="world", id=2, color=(0.0, 0.0, 1.0, 1.0))
-        self.publish_ball(target_position_in_world, frame="world", marker_id=3, color=(1.0, 1.0, 0.0, 1.0))
-        
-        target_orientation_in_world = R.from_matrix(target_orientation_in_world).as_quat()  
     
-        return target_position_in_world, target_orientation_in_world
+          
+    def create_gaze_frame(self, position_in_base):
+        """
+        Creates a frame at the given position which has a X axis pointing directly towards the robot base, and a Z axis pointing in
+        the positive direction of the robot base's Z axis(according to right hand rule) which is parallel to the ground(XY plane of robot base).
+        Practical for specifying a frame to gaze at since these choices were made to mimic the helmet's frame while the wearer is looking at the robot base.
 
-    def create_dropoff_frame(self, dropoff_position_in_base):  
-        dropoff_position_in_world = self.base_to_world_homogeneous @ np.array([dropoff_position_in_base[0], dropoff_position_in_base[1], dropoff_position_in_base[2], 1.0]).T
-        dropoff_position_in_world = dropoff_position_in_world[:3]
+        Args:
+            position_in_base (_type_): 3D position in the robot base frame where the frame should be created.
+
+        Returns:
+            tuple: A tuple containing the position and orientation of the created frame in the world frame.
+        """
+        frame_position_in_world = self.base_to_world_homogeneous @ np.array([position_in_base[0], position_in_base[1], position_in_base[2], 1.0]).T
+        frame_position_in_world = frame_position_in_world[:3]
+        
+        frame_orientation_y = np.array([0.0, 0.0, 1.0])
+        frame_orientation_x = -(position_in_base)/np.linalg.norm(position_in_base)
+        frame_orientation_z = np.cross(frame_orientation_x, frame_orientation_y)
+        frame_orientation_y = np.cross(frame_orientation_z, frame_orientation_x)
+        frame_orientation_y /= np.linalg.norm(frame_orientation_y)
+        frame_orientation_z /= np.linalg.norm(frame_orientation_z)
+        
+        frame_orientation = np.eye(3)
+        frame_orientation[:, 0] = frame_orientation_x
+        frame_orientation[:, 1] = frame_orientation_y
+        frame_orientation[:, 2] = frame_orientation_z
+        frame_orientation_in_world = self.base_to_world_homogeneous[:3, :3] @ frame_orientation
                
-        dropoff_orientation_z = np.array([0.0, 0.0, -1.0])
-        dropoff_orientation_y = dropoff_position_in_base/np.linalg.norm(dropoff_position_in_base)
-        dropoff_orientation_x = np.cross(dropoff_orientation_y, dropoff_orientation_z)
-        dropoff_orientation_x /= np.linalg.norm(dropoff_orientation_x)
-        dropoff_orientation_y = np.cross(dropoff_orientation_z, dropoff_orientation_x)
-        dropoff_orientation_y /= np.linalg.norm(dropoff_orientation_y)
+        #self.publish_arrow(start_pos=frame_position_in_world, end_pos=frame_position_in_world + 0.5 * frame_orientation_in_world[:, 0], frame="world", id=50, color=(1.0, 0.0, 0.0, 1.0))
+        #self.publish_arrow(start_pos=frame_position_in_world, end_pos=frame_position_in_world + 0.5 * frame_orientation_in_world[:, 1], frame="world", id=51, color=(0.0, 1.0, 0.0, 1.0))
+        #self.publish_arrow(start_pos=frame_position_in_world, end_pos=frame_position_in_world + 0.5 * frame_orientation_in_world[:, 2], frame="world", id=52, color=(0.0, 0.0, 1.0, 1.0))
+        #self.publish_ball(frame_position_in_world, frame="world", marker_id=53, color=(1.0, 1.0, 0.0, 1.0))
         
-        dropoff_orientation = np.eye(3)
-        dropoff_orientation[:, 0] = dropoff_orientation_x
-        dropoff_orientation[:, 1] = dropoff_orientation_y
-        dropoff_orientation[:, 2] = dropoff_orientation_z
-        dropoff_orientation_in_world = self.base_to_world_homogeneous[:3, :3] @ dropoff_orientation
-               
-        #self.publish_arrow(start_pos=dropoff_position_in_world, end_pos=dropoff_position_in_world + 0.5 * dropoff_orientation_in_world[:, 0], frame="world", id=4, color=(1.0, 0.0, 0.0, 1.0))
-        #self.publish_arrow(start_pos=dropoff_position_in_world, end_pos=dropoff_position_in_world + 0.5 * dropoff_orientation_in_world[:, 1], frame="world", id=5, color=(0.0, 1.0, 0.0, 1.0))
-        #self.publish_arrow(start_pos=dropoff_position_in_world, end_pos=dropoff_position_in_world + 0.5 * dropoff_orientation_in_world[:, 2], frame="world", id=6, color=(0.0, 0.0, 1.0, 1.0))
-        
-        dropoff_orientation_in_world = R.from_matrix(dropoff_orientation_in_world).as_quat()
-        
-        return dropoff_position_in_world, dropoff_orientation_in_world
+        frame_orientation_in_world = R.from_matrix(frame_orientation_in_world).as_quat()  
     
-    def gaze_at_object(self, object_position_in_base):
+        return frame_position_in_world, frame_orientation_in_world
+
+    def create_downwards_frame(self, position_in_base):
+        """
+        Creates a frame at the given position which has a Z axis pointing downwards, and a Y axis pointing away 
+        from the robot base but parallel to the ground(XY plane of robot base). Practical for specifying a pickup or dropoff frame since 
+        the gripper would be pointing downwards(due to Z) and the camera would not be between the base and the gripper(due to Y).
+
+        Args:
+            position_in_base (_type_): 3D position in the robot base frame where the frame should be created.
+
+        Returns:
+            tuple: A tuple containing the position and orientation of the created frame in the world frame.
+        """
+        frame_position_in_world = self.base_to_world_homogeneous @ np.array([position_in_base[0], position_in_base[1], position_in_base[2], 1.0]).T
+        frame_position_in_world = frame_position_in_world[:3]
+               
+        frame_orientation_z = np.array([0.0, 0.0, -1.0])
+        frame_orientation_y = position_in_base/np.linalg.norm(position_in_base)
+        frame_orientation_x = np.cross(frame_orientation_y, frame_orientation_z)
+        frame_orientation_x /= np.linalg.norm(frame_orientation_x)
+        frame_orientation_y = np.cross(frame_orientation_z, frame_orientation_x)
+        frame_orientation_y /= np.linalg.norm(frame_orientation_y)
+        
+        frame_orientation = np.eye(3)
+        frame_orientation[:, 0] = frame_orientation_x
+        frame_orientation[:, 1] = frame_orientation_y
+        frame_orientation[:, 2] = frame_orientation_z
+        frame_orientation_in_world = self.base_to_world_homogeneous[:3, :3] @ frame_orientation
+               
+        #self.publish_arrow(start_pos=frame_position_in_world, end_pos=frame_position_in_world + 0.5 * frame_orientation_in_world[:, 0], frame="world", id=64, color=(1.0, 0.0, 0.0, 1.0))
+        #self.publish_arrow(start_pos=frame_position_in_world, end_pos=frame_position_in_world + 0.5 * frame_orientation_in_world[:, 1], frame="world", id=65, color=(0.0, 1.0, 0.0, 1.0))
+        #self.publish_arrow(start_pos=frame_position_in_world, end_pos=frame_position_in_world + 0.5 * frame_orientation_in_world[:, 2], frame="world", id=66, color=(0.0, 0.0, 1.0, 1.0))
+        self.publish_ball(frame_position_in_world, frame="world", marker_id=67, color=(1.0, 1.0, 0.0, 1.0))
+        
+        frame_orientation_in_world = R.from_matrix(frame_orientation_in_world).as_quat()
+        
+        return frame_position_in_world, frame_orientation_in_world
+    
+    
+    def gaze_at_point(self, point_in_base):
         gaze_velocities = np.ones(4)
             
-        target_position_in_world, target_orientation_in_world = self.create_object_frame(object_position_in_base)
-                
+        target_position_in_world, target_orientation_in_world = self.create_gaze_frame(point_in_base)
+        
         set_joint_positions = np.array([0.0, -np.pi/2, -np.pi/2, -np.pi*3/8, 0.0, -np.pi])
         total_error = np.ones(4)
         gaze_takeover = False
         set_velocity_coefficient = 0.8
-        while np.linalg.norm(total_error) > 0.025 and rclpy.ok():
+        while np.linalg.norm(total_error) > 0.01 and rclpy.ok():
             gaze_velocities, _, total_error = self.get_gaze_velocities(target_position=target_position_in_world,
                                                             target_orientation=target_orientation_in_world,
                                                             waist_ratio=0.35,
@@ -163,7 +135,7 @@ class ExperimentController(BreatheAndGazeController):
                                             0.0,
                                             set_joint_positions[5] - self.joint_states_global["pos"][5]]) * set_velocity_coefficient
                         
-            if not gaze_takeover and total_error[0] <= 0.2 and abs(set_joint_positions[3] - self.joint_states_global["pos"][3]) <= 0.1:
+            if not gaze_takeover and total_error[0] <= 0.1 and abs(set_joint_positions[3] - self.joint_states_global["pos"][3]) <= 0.1:
                 gaze_takeover = True
             
             if gaze_takeover:
@@ -176,18 +148,59 @@ class ExperimentController(BreatheAndGazeController):
             
         self.stop_movement()
         self.get_logger().info(f"Gaze completed. Final Total Error: {total_error}, Total Error Norm: {np.linalg.norm(total_error):.2f}")
-        
-        self.grasp_signal_publisher.publish(Bool(data=True))
-        self.get_logger().info("Grasp signal published.")
-        
     
+            
     def get_placement_position(self):
         return np.array([0.0, 0.5, 0.1])  # Example placement position in base frame
       
+    def is_in_bin(self, position_in_world): #TODO: implement a proper check based on the bin's dimensions and position
+        return False
+      
     def object_to_pick_up(self):
-        return np.array([0.5, 0.0, 0.1])  # Example object position in base frame
+        """
+        Searches the TF tree for markers that are within the defined REACHABLE_DISTANCE and PICK_UP_HEIGHT range, 
+        and returns the position of the first suitable object found in world frame.
+
+        Returns:
+            marker_position (np.array): The position of the object to pick up in world frame, or None if no suitable object is found.
+        """
+        frame_name_prefix = "marker_"
+        
+        try:
+            all_frames = self.tfBuffer._getFrameStrings()
+            marker_frames = [frame for frame in all_frames if frame.startswith(frame_name_prefix)]
+            
+            for marker_frame in marker_frames:
+                if self.tfBuffer.can_transform("world", marker_frame, rclpy.time.Time()):
+                    marker_pose = self.tfBuffer.lookup_transform("world", marker_frame, rclpy.time.Time())
+                    marker_position = np.array([marker_pose.transform.translation.x,
+                                                marker_pose.transform.translation.y,
+                                                marker_pose.transform.translation.z])
+                    
+                    marker_height = marker_position[2]
+                    distance_to_base = np.linalg.norm(self.base_position_in_world[:2] - marker_position[:2])
+                    self.get_logger().info(f"Checking marker: {marker_frame}, Position: {marker_position}, Height: {marker_height:.2f}, Distance to Base: {distance_to_base:.2f}")
+                    if PICK_UP_MIN_HEIGHT <= marker_height <= PICK_UP_MAX_HEIGHT and distance_to_base <= MAX_REACHABLE_DISTANCE and not self.is_in_bin(marker_position):
+                        self.get_logger().info(f"Found object to pick up: {marker_frame} at position {marker_position}")
+                        self.publish_ball(marker_position, frame="world", marker_id=99, color=(1.0, 0.0, 0.0, 1.0))
+                        return marker_position
+                        
+        except Exception as e:
+            self.get_logger().error(f"Error while fetching frames: {e}")
+            return None
+        
+        self.get_logger().warn("No suitable object found to pick up.")
+        return None
+    
     
     def pick_up_object(self, object_pose=None, speed=None):
+        """
+        Picks up an object in the given pose at the given speed.
+
+        Args:
+            object_pose (np.array, optional): The position and orientation in the base frame. Defaults to None.
+            speed (Float, optional): The speed at which the end effector would be moving. Defaults to None.
+        """
         if speed is None:
             speed = self.speed
         
@@ -240,7 +253,7 @@ class ExperimentController(BreatheAndGazeController):
         if speed is None:
             speed = self.speed
         
-        _, dropoff_orientation = self.create_dropoff_frame(recepticle_position)        
+        _, dropoff_orientation = self.create_downwards_frame(recepticle_position)        
         dropoff_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(dropoff_orientation).as_matrix()).as_quat()
         
         self.go_to_pose_in_base_with_cubic_spline(desired_coordinate=recepticle_position,
@@ -251,13 +264,14 @@ class ExperimentController(BreatheAndGazeController):
         self.open_gripper()
         self.get_logger().info("Placed the object.")
 
-    def hand_object_over(self, handover_position=None, handover_orientation=None, speed=None):
+    def hand_object_over(self, handover_position=None, handover_orientation=None, speed=None): #TODO: make dynamic
         if speed is None:
             speed = self.speed
         if handover_position is None:
             handover_position = self.handover_position
         if handover_orientation is None:
-            handover_orientation = self.handover_orientation
+            _, handover_orientation = self.create_downwards_frame(handover_position)        
+            handover_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(handover_orientation).as_matrix()).as_quat()
         
         eef_position = self.get_current_coordinate()
         eef_position[2] = 0.0
@@ -284,6 +298,23 @@ class ExperimentController(BreatheAndGazeController):
         
         self.close_gripper_async()
 
+
+    def find_and_pick_up_object(self, speed=None):
+        if speed is None:
+            speed = self.speed
+            
+        object_position = self.object_to_pick_up()
+        if object_position is None:
+            self.get_logger().warn("Can't find and pick up object because no suitable object was found.")
+            return
+        
+        object_position_in_base = (self.world_to_base_homogeneous @ np.array([object_position[0], object_position[1], object_position[2], 1.0]).T)[:3]
+        pickup_orientation = self.create_downwards_frame(object_position_in_base)[1]
+        pickup_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(pickup_orientation).as_matrix()).as_quat()
+        pickup_pose = np.concatenate((object_position_in_base, pickup_orientation))
+        
+        self.pick_up_object(object_pose=pickup_pose, speed=speed)
+        
 class apf_generator:
     def __init__(self, apf_source_name: str = "", apf_constant: float = 0.01, threshold_distance: float = 0.50, max_force: float = 0.1):
         self.apf_source_name = apf_source_name
@@ -344,25 +375,30 @@ def observer(experiment_controller: ExperimentController = None, frequency: int 
         sleep_time = max(0, (1.0 / frequency) - elapsed_time)
         time.sleep(sleep_time)
          
-def machine(experiment_controller: ExperimentController = None):    
+def machine(experiment_controller: ExperimentController = None):  
+    state = 0  
     while rclpy.ok():
-        if experiment_controller.clicked_event.is_set():
-            experiment_controller.clicked_event.wait()
-            clicked_point = experiment_controller.last_clicked_point_in_base
-            experiment_controller.clicked_event.clear()
-            
-            experiment_controller.gaze_at_object(clicked_point)
-            
-            experiment_controller.grasp_event.wait()
-            experiment_controller.grasp_event.clear()
-            
-            if not experiment_controller.grasp_pose.any() or np.all(experiment_controller.grasp_pose == -1.0):
-                experiment_controller.get_logger().error("No valid grasp pose found.")
-            else:
-                experiment_controller.pick_up_object(experiment_controller.grasp_pose)
+        if state == 1: # basically if in grasping mode
+            #TODO: get object position
+            experiment_controller.pick_up_object(experiment_controller.grasp_pose)
                 
-                experiment_controller.hand_object_over()
-        else:            
+            place_or_handover = input("Do you want to place the object or hand it over? (place/handover): ").strip().lower()
+            if place_or_handover == "handover":
+                handover_position = np.array([-0.14, -0.65, 0.02])  # Example handover position in base frame          
+                experiment_controller.hand_object_over(handover_position=handover_position)
+            else:
+                receptacle_position = np.array([-0.65, 0.09, 0.08])  # Example receptacle position in base frame
+                experiment_controller.place_object(recepticle_position=receptacle_position)
+                
+            experiment_controller.set_breathing_gazing(go_home=True, go_home_speed=0.5)
+            state = 0
+            
+        elif state == 0: # basically if in breathing and gazing mode           
+            
+            experiment_controller.find_and_pick_up_object()
+            
+            return
+            
             breathe_and_gaze_velocities = experiment_controller.breathe_and_gaze_step()
             experiment_controller.publish_velocity_command(breathe_and_gaze_velocities)
             experiment_controller.ros_rate.sleep()
@@ -381,7 +417,7 @@ def main(args=None):
         
         print("Starting main.")
                    
-        experiment_controller.start_controller(speed=0.2, go_home=True)  # Start the controller without going to home position
+        #experiment_controller.start_controller(speed=0.2, go_home=True)
                          
         machine(experiment_controller)
         

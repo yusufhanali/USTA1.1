@@ -67,7 +67,7 @@ class BreatheAndGazeController(NewController):
         self.log_breath_forwards = False
 
 
-    def set_breathing_gazing(self, go_home=True):        
+    def set_breathing_gazing(self, go_home=True, go_home_speed=0.3):        
         try:
             self.breathing_task = np.zeros(3)
             self.target_in_base_position = np.zeros(3)
@@ -80,7 +80,7 @@ class BreatheAndGazeController(NewController):
             self.gripper.close_async()
             
             if go_home:
-                self.go_to_home_pos(0.3)                    
+                self.go_to_home_pos(go_home_speed)                    
                     
             if self.do_breathing:
                 self.init_breather()
@@ -230,8 +230,33 @@ class BreatheAndGazeController(NewController):
                     wrist3 = 0
                 wrist3 = -wrist3 if target_in_w3_y[0] > 0 else wrist3
                 wrist3 = geometry_utils.angular_wrap(wrist3)
+                # --- Limit-aware unwrapping for Wrist 3 (Joint 6) ---
+                current_q6 = self.joint_states_global["pos"][5]
+                q6_limits = ur5e_kinematics.JOINT_LIMITS[5]  # [-2*pi, 2*pi]
+                margin = 0.25  # 15 degrees margin from hard limits
+                # Check 3 equivalent candidate angles: [e, e + 2pi, e - 2pi]
+                candidates = [
+                    current_q6 + wrist3,
+                    current_q6 + wrist3 + 2 * np.pi,
+                    current_q6 + wrist3 - 2 * np.pi
+                ]
+                # Filter out any candidate that violates joint limits
+                valid_candidates = [
+                    c for c in candidates 
+                    if (q6_limits[0] + margin) <= c <= (q6_limits[1] - margin)
+                ]
+                if valid_candidates:
+                    # Choose candidate closest initial wrist3 value to avoid large jumps
+                    best_target = min(valid_candidates, key=lambda c: abs(c - (current_q6 + wrist3)))
+                    wrist3 = best_target - current_q6
+                else:
+                    # Fallback: if already trapped near limit, push away from the limit
+                    if current_q6 <= q6_limits[0] + margin:
+                        wrist3 = max(0.1, wrist3)
+                    elif current_q6 >= q6_limits[1] - margin:
+                        wrist3 = min(-0.1, wrist3)
                                 
-                gazing_velocities[3] = wrist3 * 4# * self.gaze_multiplier
+                gazing_velocities[3] = wrist3 * 4
                 total_error[3] = wrist3
                 if abs(gazing_velocities[3]) > joint_limits[3]:
                     gazing_velocities[3] = np.sign(gazing_velocities[3]) * joint_limits[3]
