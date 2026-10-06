@@ -297,6 +297,37 @@ class BreatheAndGazeController(NewController):
             self.breathe_controller.control_rate = new_rate
         return super().change_control_rate(new_rate)
 
+    def breathe_step(self):
+        target_distance = np.linalg.norm(self.target_in_base_position[:2])
+        #breathing_gazing_controller.breathe_controller.set_frequency(slope_smoother.filter(linear_slope.scale(target_distance)) if target_distance != 0 else linear_slope.min_output)
+        #print(f"Target distance: {target_distance:.2f} m, Breathe frequency: {self.breathe_controller.freq:.2f} Hz", end="\r")
+        forward = 0.0 if target_distance == 0 or target_distance > self.min_dist_to_target else target_distance-self.min_dist_to_target
+        forward = np.clip(forward, -0.7, 0.7)
+        forward = self.forward_smoother.filter(forward)
+        if self.log_breath_forwards:
+            self.breath_forwards.append(forward)
+        breathe_velocities, self.breathing_task, cx, cz = self.get_breathe_velocities(forward_movement = forward) #wedge_forward.scale((time.time() - start_time)%10))
+        if self.log_gaze_corrections:
+            self.cx_arr.append(cx)
+            self.cz_arr.append(cz)
+            
+        return breathe_velocities
+
+    def gaze_step(self, gaze_target_name=None):
+        if gaze_target_name is None:
+            gaze_target_name = self.gaze_target_name
+        target_in_world = self.tfBuffer.lookup_transform(self.world, gaze_target_name, rclpy.time.Time())
+        target_position = [target_in_world.transform.translation.x, target_in_world.transform.translation.y, target_in_world.transform.translation.z]
+        target_position = self.target_position_smoother.filter(target_position)
+        target_orientation = [target_in_world.transform.rotation.x, target_in_world.transform.rotation.y, target_in_world.transform.rotation.z, target_in_world.transform.rotation.w]
+        gaze_velocities, self.target_in_base_position, _ = self.get_gaze_velocities(target_position=target_position,
+                                                                                                   target_orientation=target_orientation,
+                                                                                                   breathing_task=np.array([self.breathing_task[0], 0.0, self.breathing_task[1]]),
+                                                                                                   waist_ratio=0.5
+                                                                                                   )
+        
+        return gaze_velocities
+    
     def breathe_and_gaze_step(self):
         if self.log_frequencies:
                 self.freqs.append(1.0 / (time.time() - self.freq_start_time))
@@ -306,29 +337,10 @@ class BreatheAndGazeController(NewController):
         gaze_velocities = np.zeros(self.num_of_gazing_joints)
         
         if self.do_breathing:
-            target_distance = np.linalg.norm(self.target_in_base_position[:2])
-            #breathing_gazing_controller.breathe_controller.set_frequency(slope_smoother.filter(linear_slope.scale(target_distance)) if target_distance != 0 else linear_slope.min_output)
-            #print(f"Target distance: {target_distance:.2f} m, Breathe frequency: {self.breathe_controller.freq:.2f} Hz", end="\r")
-            forward = 0.0 if target_distance == 0 or target_distance > self.min_dist_to_target else target_distance-self.min_dist_to_target
-            forward = np.clip(forward, -0.7, 0.7)
-            forward = self.forward_smoother.filter(forward)
-            if self.log_breath_forwards:
-                self.breath_forwards.append(forward)
-            breathe_velocities, self.breathing_task, cx, cz = self.get_breathe_velocities(forward_movement = forward) #wedge_forward.scale((time.time() - start_time)%10))
-            if self.log_gaze_corrections:
-                self.cx_arr.append(cx)
-                self.cz_arr.append(cz)
+            breathe_velocities = self.breathe_step()
 
         if self.do_gazing:
-                target_in_world = self.tfBuffer.lookup_transform(self.world, self.gaze_target_name, rclpy.time.Time())
-                target_position = [target_in_world.transform.translation.x, target_in_world.transform.translation.y, target_in_world.transform.translation.z]
-                target_position = self.target_position_smoother.filter(target_position)
-                target_orientation = [target_in_world.transform.rotation.x, target_in_world.transform.rotation.y, target_in_world.transform.rotation.z, target_in_world.transform.rotation.w]
-                gaze_velocities, self.target_in_base_position, _ = self.get_gaze_velocities(target_position=target_position,
-                                                                                                           target_orientation=target_orientation,
-                                                                                                           breathing_task=np.array([self.breathing_task[0], 0.0, self.breathing_task[1]]),
-                                                                                                           waist_ratio=0.5
-                                                                                                           )
+            gaze_velocities = self.gaze_step()
         
         total_velocities = np.array([gaze_velocities[0], breathe_velocities[0], breathe_velocities[1], gaze_velocities[1] , gaze_velocities[2], gaze_velocities[3]])
         

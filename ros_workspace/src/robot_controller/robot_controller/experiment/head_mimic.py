@@ -18,7 +18,7 @@ class HeadMimicController(BreatheAndGazeController):
     def __init__(self):
         super().__init__()
         
-        #self.gaze_target_name = 'gaze_target'
+        self.gaze_target_name = 'rigid_body_9'
         
         self.prev_head_position = None
         self.prev_head_orientation = None

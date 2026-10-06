@@ -74,14 +74,16 @@ class CubicSplineController():
         self.robot = robot
         self.start_point = start_point
         self.end_point = end_point
+        self.end_point_changed = False
         self.start_derivative = start_derivative
         self.end_derivative = end_derivative
         self.desired_orientation = desired_orientation
+        self.desired_orientation_changed = False
         self.speed = speed if speed < 0.8 else 0.8
         self.control_rate = control_rate  # Hz
 
-        self.slow_start_threshold = 0.1
-        self.slow_end_threshold = 0.1
+        self.slow_start_threshold = 0.15
+        self.slow_end_threshold = 0.15
 
         self.t = 0.0
 
@@ -93,7 +95,7 @@ class CubicSplineController():
         self.z_coordinate, \
         self.x_derivative, \
         self.y_derivative, \
-        self.z_derivative = self.get_cubic_spline_equations()
+        self.z_derivative = self.calculate_cubic_spline_equations()
         self.robot.publish_marker_array(self.trajectory_MarkerArray())
         
         self.trajectory_length = self.calculate_curve_length()
@@ -104,7 +106,7 @@ class CubicSplineController():
         self.robot.get_logger().info(f"Estimated time to complete trajectory: {self.estimated_total_time}")
         
         if desired_orientation is not None:
-            desired_rot_speed = self.get_rotation_speed(desired_orientation, self.estimated_total_time)
+            desired_rot_speed = self.calculate_rotation_speed(desired_orientation, self.estimated_total_time)
         else:
             desired_rot_speed = np.zeros(3)
         self.desired_rot_speed = desired_rot_speed
@@ -112,7 +114,8 @@ class CubicSplineController():
         
         self.current_error = 0.0
 
-    def get_rotation_speed(self, desired_orientation, remaining_time):
+
+    def calculate_rotation_speed(self, desired_orientation, remaining_time):
         rotvec = self.rotation_vector(desired_orientation)
         if remaining_time > 0:
             desired_rot_speed = rotvec / (remaining_time * 0.9)  # 0.9 is a safety factor to ensure we reach the desired orientation in time
@@ -120,7 +123,7 @@ class CubicSplineController():
             desired_rot_speed = np.zeros(3)
         return desired_rot_speed
                         
-    def get_cubic_spline_equations(self, start_point=None, end_point=None, start_derivative=None, end_derivative=None):
+    def calculate_cubic_spline_equations(self, start_point=None, end_point=None, start_derivative=None, end_derivative=None):
         if start_point is None:
             start_point = self.start_point
         if end_point is None:
@@ -200,6 +203,16 @@ class CubicSplineController():
         
         return length / speed if speed > 0 else 5
 
+
+    def set_end_point(self, new_end_point):
+        self.end_point = new_end_point
+        self.end_point_changed = True
+    
+    def set_desired_orientation(self, new_desired_orientation):
+        self.desired_orientation = new_desired_orientation
+        self.desired_orientation_changed = True
+        self.rotation_reached = False
+
     def refresh_derivatives(self):        
         start_point = self.robot.get_current_coordinate()
 
@@ -218,7 +231,7 @@ class CubicSplineController():
         else:
             safe_end_derivative = np.zeros(3)
         
-        here_to_end_equations = self.get_cubic_spline_equations(
+        here_to_end_equations = self.calculate_cubic_spline_equations(
             start_point=start_point, 
             end_point=self.end_point, 
             start_derivative=start_derivative, 
@@ -252,10 +265,10 @@ class CubicSplineController():
                 else:
                     remaining_time = self.calculate_remaining_time(self.calculate_remaining_trajectory_length())
                     self.desired_rot_speed = rotvec / (remaining_time * 0.9)
-                    self.robot.get_logger().info(f"Rotation error norm: {rotation_error_norm}, remaining time: {remaining_time}, updated desired rotational speed: {self.desired_rot_speed}")
+                    #self.robot.get_logger().info(f"Rotation error norm: {rotation_error_norm}, remaining time: {remaining_time}, updated desired rotational speed: {self.desired_rot_speed}")
                     self.rotation_reached = False
                     
-            if self.current_error > max_error and self.t > 0.5 and self.t < 0.95:
+            if self.desired_orientation_changed or self.end_point_changed or (self.current_error > max_error and self.t > 0.5 and self.t < 0.95):
                 self.refresh_derivatives()
               
         velocity_desired = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
@@ -288,6 +301,7 @@ class CubicSplineController():
         self.tick_counter += 1
                 
         return desired_speed
+    
     
     def trajectory_MarkerArray(self, num_points=200, t=None, x_coordinate=None, y_coordinate=None, z_coordinate=None, color=(1.0, 1.0, 0.0, 1.0), id_offset=0, draw_fully=False):
         if x_coordinate is None:
@@ -644,14 +658,17 @@ class NewController(Node):
         velocity_command = trajectory / delta_t
         self.get_logger().info(f"desired_joint_positions: {desired_joint_positions}")
         self.get_logger().info(f"velocity_command: {velocity_command}")
-            
-        self.publish_velocity_command(velocity_command)
         
         start_time = time.time()
         
-        position_error = np.linalg.norm(desired_joint_positions - self.joint_states_global["pos"])
-        while position_error > 0.0005 and time.time() - start_time < delta_t + 0.1:
+        position_error = np.linalg.norm(desired_joint_positions - self.joint_states_global["pos"])        
+        soft_start_stop_filter = control_and_filters.WedgeShapedScaler(min_input=0.0, max_input=position_error, entry_distance=0.2*position_error, exit_distance=0.2*position_error, peak_output=1.0, min_output=0.25)
+        
+        while position_error > 0.002:
             position_error = np.linalg.norm(desired_joint_positions - self.joint_states_global["pos"])
+            speed_scale = soft_start_stop_filter.scale(position_error)
+            self.publish_velocity_command(velocity_command * speed_scale)
+            self.ros_rate.sleep()
             
         self.stop_movement() 
         
@@ -723,6 +740,36 @@ class NewController(Node):
         self.stop_movement()
         self.get_logger().info(f"Position reached, current position: {current_coordinate}")
 
+    def raise_eef(self, height=0.1, speed=None):
+        if speed is None:
+            speed = self.speed
+        
+        current_coordinate = self.get_current_coordinate()
+        desired_coordinate = current_coordinate + np.array([0, 0, height])
+        
+        self.go_to_pose_in_base(desired_coordinate=desired_coordinate, speed=speed)
+
+    def joint_velocity_towards_point_in_base(self, point_in_base, desired_orientation=None, angular_speed=None, linear_speed=None):
+        if linear_speed is None:
+            linear_speed = self.speed
+        
+        current_position = self.get_current_coordinate()
+        direction_vector = point_in_base - current_position
+        linear_error = np.linalg.norm(direction_vector)
+        linear_velocity = np.zeros(3)
+        if linear_error > 1e-4:
+            linear_velocity = (direction_vector / linear_error) * linear_speed
+        
+        angular_velocity = np.zeros(3)
+        if desired_orientation is not None:
+            rotvec = self.rotation_vector(desired_orientation)
+            angular_velocity = (rotvec / np.linalg.norm(rotvec)) * angular_speed
+        
+        combined_velocity = np.concatenate((linear_velocity, angular_velocity))
+        
+        joint_velocity = self.get_inverse_jacobian() @ combined_velocity
+        return joint_velocity, linear_error
+
     
     def create_cubic_spline_controller(self, start_point, end_point, start_derivative, end_derivative, desired_orientation=None, speed=None):
         if speed is None:
@@ -769,6 +816,27 @@ class NewController(Node):
         self.stop_movement()
         self.get_logger().info(f"Current t: {cubic_spline_controller.t} Current position: {self.get_current_coordinate()} - Desired position: {desired_coordinate}")
         self.get_logger().info(f"Error: {np.linalg.norm(desired_coordinate - self.get_current_coordinate())}")
+        
+    def go_to_pose_in_base_with_provided_cubic_spline(self, desired_coordinate=None, cubic_spline_controller=None, max_error=0.001):
+            if cubic_spline_controller is None:
+                self.get_logger().warn("No cubic spline controller provided, use the other version of this function or provide one.")
+                return            
+            
+            current_error = np.linalg.norm(desired_coordinate - self.get_current_coordinate())           
+            while rclpy.ok() and current_error > max_error and cubic_spline_controller.t < 1.0:            
+                velocity_command = cubic_spline_controller.get_cubic_velocities()
+                
+                pinv_jacobian = self.get_inverse_jacobian()
+                velocity_command = pinv_jacobian @ velocity_command
+                
+                self.publish_velocity_command(velocity_command) 
+                
+                current_error = np.linalg.norm(desired_coordinate - self.get_current_coordinate())
+                self.ros_rate.sleep()
+                
+            self.stop_movement()
+            self.get_logger().info(f"Current t: {cubic_spline_controller.t} Current position: {self.get_current_coordinate()} - Desired position: {desired_coordinate}")
+            self.get_logger().info(f"Error: {np.linalg.norm(desired_coordinate - self.get_current_coordinate())}")
         
         
     def publish_marker(self, marker):

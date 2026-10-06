@@ -57,6 +57,9 @@ class VectorLinearFilter:
 
     def reset(self):
         self.filtered_value = np.zeros(self.dimension)
+        
+    def set_value(self, value):
+        self.filtered_value = np.array(value)
 
     def filter(self, x):
         self.filtered_value = self.alpha * np.array(x) + (1 - self.alpha) * self.filtered_value

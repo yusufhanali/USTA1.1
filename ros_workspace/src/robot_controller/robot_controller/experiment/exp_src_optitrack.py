@@ -24,6 +24,16 @@ class ExperimentController(BreatheAndGazeController):
     def init_interaction_stuff(self):        
         self.handover_orientation = np.array([0.8001031, 0.3314136, 0.1913417, 0.4619398])
         self.handover_position = np.array([0.4, -0.6, 0.5])
+        
+        self.hand_frame = "rigid_body_9"
+        self.hand_position_smoother = cf.VectorLinearFilter(alpha=0.1, dimension=3)
+        
+        while not self.tfBuffer.can_transform(self.world, self.hand_frame, rclpy.time.Time()):
+            self.init_tf()
+            self.get_logger().warn(f"Waiting for TF transform from {self.world} to {self.hand_frame}...")
+            time.sleep(0.5)
+        
+        self.hand_position_smoother.set_value(self.get_hand_position_in_world()/self.hand_position_smoother.alpha)
     
     def __init__(self, name = "experiment_controller"):
         super().__init__(name)
@@ -109,8 +119,44 @@ class ExperimentController(BreatheAndGazeController):
         
         return frame_position_in_world, frame_orientation_in_world
     
+    def create_outwards_frame(self, position_in_base):
+        """
+        Creates a frame at the given position which has Z axis pointing away from the robot base, and a Y axis pointing upwards.
+        Practical for specifying a frame to hand objects over.
+
+        Args:
+            position_in_base (_type_): 3D position in the robot base frame where the frame should be created.
+
+        Returns:
+            tuple: A tuple containing the position and orientation of the created frame in the base frame.
+        """
+        frame_position_in_base = position_in_base.copy()
+        frame_position_in_base[2] = 0.0 
+        
+        frame_orientation_y = np.array([0.0, 0.0, 1.0])
+        frame_orientation_z = frame_position_in_base/np.linalg.norm(frame_position_in_base)
+        frame_orientation_x = np.cross(frame_orientation_y, frame_orientation_z)
+        frame_orientation_y = np.cross(frame_orientation_z, frame_orientation_x)
+        frame_orientation_y /= np.linalg.norm(frame_orientation_y)
+        frame_orientation_x /= np.linalg.norm(frame_orientation_x)
+        frame_orientation_z /= np.linalg.norm(frame_orientation_z)
+        
+        frame_orientation = np.eye(3)
+        frame_orientation[:, 0] = frame_orientation_x
+        frame_orientation[:, 1] = frame_orientation_y
+        frame_orientation[:, 2] = frame_orientation_z
+               
+        #self.publish_arrow(start_pos=position_in_base, end_pos=position_in_base + 0.5 * frame_orientation[:, 0], frame=self.base, id=50, color=(1.0, 0.0, 0.0, 1.0))
+        #self.publish_arrow(start_pos=position_in_base, end_pos=position_in_base + 0.5 * frame_orientation[:, 1], frame=self.base, id=51, color=(0.0, 1.0, 0.0, 1.0))
+        #self.publish_arrow(start_pos=position_in_base, end_pos=position_in_base + 0.5 * frame_orientation[:, 2], frame=self.base, id=52, color=(0.0, 0.0, 1.0, 1.0))
+        #self.publish_ball(position_in_base, frame=self.base, marker_id=53, color=(1.0, 1.0, 0.0, 1.0))
+        
+        frame_orientation_in_base = R.from_matrix(frame_orientation).as_quat()  
     
-    def gaze_at_point(self, point_in_base):
+        return position_in_base, frame_orientation_in_base
+    
+    
+    def look_at_point_in_base(self, point_in_base):
         gaze_velocities = np.ones(4)
             
         target_position_in_world, target_orientation_in_world = self.create_gaze_frame(point_in_base)
@@ -149,6 +195,44 @@ class ExperimentController(BreatheAndGazeController):
         self.stop_movement()
         self.get_logger().info(f"Gaze completed. Final Total Error: {total_error}, Total Error Norm: {np.linalg.norm(total_error):.2f}")
     
+    def look_at_point_in_world(self, point_in_world):
+        point_in_base = (self.world_to_base_homogeneous @ np.array([point_in_world[0], point_in_world[1], point_in_world[2], 1.0]).T)[:3]
+        self.look_at_point_in_base(point_in_base)
+    
+    def gaze_velocities_at_frame(self, frame_name="rigid_body_9", publish_marker=True):
+        frame_transform = self.tfBuffer.lookup_transform("world", frame_name, rclpy.time.Time())
+        frame_position = np.array([frame_transform.transform.translation.x,
+                                      frame_transform.transform.translation.y,
+                                      frame_transform.transform.translation.z])
+        
+        corrected_frame_position = self.correct_optitrack_position(frame_position)
+        if publish_marker:
+            self.publish_ball(position=frame_position, frame="world", marker_id=27, color=(1.0, 0.0, 0.0, 1.0), radius=0.007)
+            self.publish_ball(position=corrected_frame_position, frame="world", marker_id=28, color=(0.0, 1.0, 1.0, 1.0), radius=0.007)
+        
+        gaze_orientation = self.create_gaze_frame(frame_position)[1]
+        
+        gaze_velocities, _, _ = self.get_gaze_velocities(target_position=frame_position,
+                                                         target_orientation=gaze_orientation)
+
+        return gaze_velocities
+
+
+    def get_hand_position_in_world(self):
+        hand_transform = self.tfBuffer.lookup_transform(self.world, self.hand_frame, rclpy.time.Time())
+        hand_position_in_world = np.array([hand_transform.transform.translation.x,
+                                           hand_transform.transform.translation.y,
+                                           hand_transform.transform.translation.z])
+        #hand_position_in_world += np.array([0.0, 0.025, 0.0])  # Empirical correction for Optitrack discrepancies 
+        hand_position_in_world = self.correct_optitrack_position(hand_position_in_world)
+        #hand_position_in_world = self.hand_position_smoother.filter(hand_position_in_world)
+        return hand_position_in_world
+
+    def get_hand_position_in_base(self):
+        hand_position_in_world = self.get_hand_position_in_world()
+        hand_position_in_world_homogeneous = np.array([hand_position_in_world[0], hand_position_in_world[1], hand_position_in_world[2], 1.0]).T
+        hand_position_in_base = (self.world_to_base_homogeneous @ hand_position_in_world_homogeneous)[:3]
+        return hand_position_in_base
             
     def get_placement_position(self):
         return np.array([0.0, 0.5, 0.1])  # Example placement position in base frame
@@ -177,6 +261,8 @@ class ExperimentController(BreatheAndGazeController):
                                                 marker_pose.transform.translation.y,
                                                 marker_pose.transform.translation.z])
                     
+                    marker_position = self.correct_optitrack_position(marker_position)
+                    
                     marker_height = marker_position[2]
                     distance_to_base = np.linalg.norm(self.base_position_in_world[:2] - marker_position[:2])
                     self.get_logger().info(f"Checking marker: {marker_frame}, Position: {marker_position}, Height: {marker_height:.2f}, Distance to Base: {distance_to_base:.2f}")
@@ -184,6 +270,8 @@ class ExperimentController(BreatheAndGazeController):
                         self.get_logger().info(f"Found object to pick up: {marker_frame} at position {marker_position}")
                         self.publish_ball(marker_position, frame="world", marker_id=99, color=(1.0, 0.0, 0.0, 1.0))
                         return marker_position
+                    else:
+                        self.get_logger().info(f"Marker {marker_frame} is not suitable for pickup. Height: {marker_height:.2f}, Distance to Base: {distance_to_base:.2f}")
                         
         except Exception as e:
             self.get_logger().error(f"Error while fetching frames: {e}")
@@ -191,11 +279,33 @@ class ExperimentController(BreatheAndGazeController):
         
         self.get_logger().warn("No suitable object found to pick up.")
         return None
-    
-    
-    def pick_up_object(self, object_pose=None, speed=None):
+
+    def correct_optitrack_position(self, object_position):
         """
-        Picks up an object in the given pose at the given speed.
+        For some reason, the Optitrack system reports positions that are slightly off from the actual positions.
+        This function attempts to correct the reported position based on observed discrepancies.
+        The 'corrections' here are empirically determined and may need to be adjusted based on further observations.
+        
+        Args:
+            object_position (np.array): The position reported by the Optitrack system.
+        Returns:
+            np.array: The corrected position.        
+        """
+        
+        corrected_poisiton = object_position + np.array([0.0035, 0.025, 0.016])
+
+        y_position = corrected_poisiton[1]
+
+        corrected_poisiton[0] += ((y_position - (-0.61)) / (1.45)) * 0.001
+        corrected_poisiton[2] += ((y_position - (-0.15)) / (1.00)) * -0.015
+        corrected_poisiton[1] += ((y_position - (0.15)) / (-0.84)) * -0.010
+
+        return corrected_poisiton
+
+
+    def hold_object(self, object_pose=None, speed=None, minimize_wrist_rotation=True):
+        """
+        Return CubicSplineController that guides the robot to hold an object in the given pose at the given speed.
 
         Args:
             object_pose (np.array, optional): The position and orientation in the base frame. Defaults to None.
@@ -204,7 +314,7 @@ class ExperimentController(BreatheAndGazeController):
         if speed is None:
             speed = self.speed
         
-        self.open_gripper()
+        self.open_gripper_async()
         
         if object_pose is None:
             object_pose = self.object_to_pick_up()
@@ -223,18 +333,19 @@ class ExperimentController(BreatheAndGazeController):
             self.get_logger().error(f"Invalid object_pose length: {len(object_pose)}. Expected either:\n3 (xyz),\n7 (xyz + xyzw),\n16 (4x4 homogeneous matrix).")
             return
         
-        #rotate around z by 180 degrees if necessary to prevent unnecessary wrist rotation
-        current_orientation_matrix = self.get_current_orientation()
-        object_orientation_matrix = R.from_quat(object_orientation).as_matrix()
-        object_orientation_matrix_rotated =  object_orientation_matrix @ R.from_euler('z', np.pi).as_matrix()
-        
-        current_to_object_orientation = R.from_matrix(current_orientation_matrix.T @ object_orientation_matrix).as_rotvec()
-        current_to_object_orientation_rotated = R.from_matrix(current_orientation_matrix.T @ object_orientation_matrix_rotated).as_rotvec()
-        current_to_object_orientation_norm = np.linalg.norm(current_to_object_orientation)
-        current_to_object_orientation_rotated_norm = np.linalg.norm(current_to_object_orientation_rotated)
-        
-        if current_to_object_orientation_rotated_norm < current_to_object_orientation_norm:
-            object_orientation = R.from_matrix(object_orientation_matrix_rotated).as_quat()
+        if minimize_wrist_rotation:
+            #rotate around z by 180 degrees if necessary to prevent unnecessary wrist rotation
+            current_orientation_matrix = self.get_current_orientation()
+            object_orientation_matrix = R.from_quat(object_orientation).as_matrix()
+            object_orientation_matrix_rotated =  object_orientation_matrix @ R.from_euler('z', np.pi).as_matrix()
+            
+            current_to_object_orientation = R.from_matrix(current_orientation_matrix.T @ object_orientation_matrix).as_rotvec()
+            current_to_object_orientation_rotated = R.from_matrix(current_orientation_matrix.T @ object_orientation_matrix_rotated).as_rotvec()
+            current_to_object_orientation_norm = np.linalg.norm(current_to_object_orientation)
+            current_to_object_orientation_rotated_norm = np.linalg.norm(current_to_object_orientation_rotated)
+            
+            if current_to_object_orientation_rotated_norm < current_to_object_orientation_norm:
+                object_orientation = R.from_matrix(object_orientation_matrix_rotated).as_quat()
         
         current_position = self.get_current_coordinate()
         movement_direction = (object_position - current_position) * [1.0, 1.0, 0.0]  # Only consider x and y for direction
@@ -264,7 +375,7 @@ class ExperimentController(BreatheAndGazeController):
         self.open_gripper()
         self.get_logger().info("Placed the object.")
 
-    def hand_object_over(self, handover_position=None, handover_orientation=None, speed=None): #TODO: make dynamic
+    def hand_object_over_to_table(self, handover_position=None, handover_orientation=None, speed=None): #TODO: make dynamic
         if speed is None:
             speed = self.speed
         if handover_position is None:
@@ -298,8 +409,58 @@ class ExperimentController(BreatheAndGazeController):
         
         self.close_gripper_async()
 
+    def calculate_handover_pose(self):
+        hand_in_base_position = self.get_hand_position_in_base()
+        hand_in_base_position[2] += 0.04  # Raise the hand position slightly to avoid collision
+        hand_in_base_position, handover_orientation = self.create_outwards_frame(hand_in_base_position)
+        
+        return hand_in_base_position, handover_orientation
+        
+    def hand_object_over_to_hand_velocities(self, speed=None):
+        if speed is None:
+            speed = self.speed
+        
+        hand_in_base_position, handover_orientation = self.calculate_handover_pose()
+        
+        current_position = self.get_current_coordinate()
+        movement_direction = (hand_in_base_position - current_position) * [1.0, 1.0, 0.0]  # Only consider x and y for direction
+        movement_direction /= np.linalg.norm(movement_direction)
+        
+        print(f"speed: {speed}")
+        cubic_spline_controller = self.create_cubic_spline_controller(start_point=current_position,
+                                                                      end_point=hand_in_base_position,
+                                                                      start_derivative=movement_direction * 0.3,  # Example start derivative
+                                                                      end_derivative=[0.0, 0.0, -0.2],  # Example end derivative
+                                                                      desired_orientation=handover_orientation,
+                                                                      speed=speed)
+        
+        max_error = 0.001
+        current_error = np.linalg.norm(hand_in_base_position - self.get_current_coordinate())
+        tick_counter = 0
+        while rclpy.ok() and current_error > max_error and cubic_spline_controller.t < 1.0:
+            if tick_counter % self.control_rate == 0:
+                tick_counter = 0
 
-    def find_and_pick_up_object(self, speed=None):
+                if current_error > 0.1: #stop once the eef is close enough to the hand, to avoid shaking
+                    hand_in_base_position, handover_orientation = self.calculate_handover_pose()
+                    cubic_spline_controller.set_end_point(hand_in_base_position)
+                    cubic_spline_controller.set_desired_orientation(handover_orientation)
+
+            velocity_command = cubic_spline_controller.get_cubic_velocities()
+            
+            pinv_jacobian = self.get_inverse_jacobian()
+            velocity_command = pinv_jacobian @ velocity_command
+            
+            self.publish_velocity_command(velocity_command) 
+            
+            current_error = np.linalg.norm(hand_in_base_position - self.get_current_coordinate())
+            tick_counter += 1
+            self.ros_rate.sleep()
+        
+        self.open_gripper()
+        self.get_logger().info("Handed over the object to the hand.")
+    
+    def discover_and_hold_object(self, speed=None):
         if speed is None:
             speed = self.speed
             
@@ -309,11 +470,14 @@ class ExperimentController(BreatheAndGazeController):
             return
         
         object_position_in_base = (self.world_to_base_homogeneous @ np.array([object_position[0], object_position[1], object_position[2], 1.0]).T)[:3]
+        object_position_in_base[2] -= 0.04
         pickup_orientation = self.create_downwards_frame(object_position_in_base)[1]
         pickup_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(pickup_orientation).as_matrix()).as_quat()
         pickup_pose = np.concatenate((object_position_in_base, pickup_orientation))
         
-        self.pick_up_object(object_pose=pickup_pose, speed=speed)
+        self.hold_object(object_pose=pickup_pose, speed=speed, minimize_wrist_rotation=False)
+
+
         
 class apf_generator:
     def __init__(self, apf_source_name: str = "", apf_constant: float = 0.01, threshold_distance: float = 0.50, max_force: float = 0.1):
@@ -358,7 +522,7 @@ class apf_generator:
             return np.zeros(3)
                 
 def observer(experiment_controller: ExperimentController = None, frequency: int = 30):    
-    human_apf_generator = apf_generator(apf_source_name = "rigid_body_9", apf_constant = 0.005, threshold_distance = 0.40, max_force = 1.5)
+    human_apf_generator = apf_generator(apf_source_name = "rigid_body_1", apf_constant = 0.005, threshold_distance = 0.40, max_force = 1.5)
 
     while rclpy.ok():
         loop_start_time = time.time()
@@ -376,11 +540,15 @@ def observer(experiment_controller: ExperimentController = None, frequency: int 
         time.sleep(sleep_time)
          
 def machine(experiment_controller: ExperimentController = None):  
-    state = 0  
+    state_0 = "breathing_gazing" 
+    state_1 = "picking_up"
+    state_2 = "placing"
+    state_3 = "handing_over"
+    
+    state = 0
     while rclpy.ok():
         if state == 1: # basically if in grasping mode
-            #TODO: get object position
-            experiment_controller.pick_up_object(experiment_controller.grasp_pose)
+            experiment_controller.hold_object(experiment_controller.grasp_pose)
                 
             place_or_handover = input("Do you want to place the object or hand it over? (place/handover): ").strip().lower()
             if place_or_handover == "handover":
@@ -393,15 +561,22 @@ def machine(experiment_controller: ExperimentController = None):
             experiment_controller.set_breathing_gazing(go_home=True, go_home_speed=0.5)
             state = 0
             
-        elif state == 0: # basically if in breathing and gazing mode           
+        elif state == 0: # handover test   
             
-            experiment_controller.find_and_pick_up_object()
+            experiment_controller.discover_and_hold_object()
+            experiment_controller.raise_eef(0.002, speed=0.05)
+            
+            experiment_controller.hand_object_over_to_hand_velocities(speed=0.2)
             
             return
             
-            breathe_and_gaze_velocities = experiment_controller.breathe_and_gaze_step()
-            experiment_controller.publish_velocity_command(breathe_and_gaze_velocities)
+            experiment_controller.publish_velocity_command(total_velocities)
             experiment_controller.ros_rate.sleep()
+
+            #experiment_controller.discover_and_hold_object()
+            #return
+            
+            
     
     
 def main(args=None):
@@ -412,12 +587,12 @@ def main(args=None):
         controller_spin_thread = threading.Thread(target=spin_thread, args=(experiment_controller,))
         controller_spin_thread.start()
         
-        observer_thread = threading.Thread(target=observer, args=(experiment_controller, ))
-        observer_thread.start()
+        #observer_thread = threading.Thread(target=observer, args=(experiment_controller, ))
+        #observer_thread.start()
         
         print("Starting main.")
                    
-        #experiment_controller.start_controller(speed=0.2, go_home=True)
+        experiment_controller.start_controller(speed=0.3, go_home=True)
                          
         machine(experiment_controller)
         
@@ -433,6 +608,6 @@ def main(args=None):
 
     rclpy.try_shutdown()
     controller_spin_thread.join()
-    observer_thread.join()
+    #observer_thread.join()
     
     os.system("cowsay ' take care of yourself '")
