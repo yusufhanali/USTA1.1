@@ -23,7 +23,7 @@ class TransformController(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
-        self.controlled_frame = 'overhead_hri_camera_link'
+        self.controlled_frame = 'mock_hand'
         self.parent_of_controlled_frame = 'world'
         self.world_frame = 'world'
         
@@ -38,13 +38,14 @@ class TransformController(Node):
         self.parent_to_world_matrix = linalg_utils.transform_to_matrix(self.parent_to_world_transform)
         
         
-        self.position = [0.8822, -1.489, 2.2328]  # x, y, z
+        self.position = [1.1, 0.0, 1.0]  # x, y, z
         #self.relative_head_orientation = [-1.6007963, -1.5457963, 0.0868] # aerial xyz
         self.relative_orientation_quat = [-0.26430327, 0.27674969, 0.65393444, 0.65262787]  # xyzw format
         self.change_wrt_world = [0.0, 0.0, 0.0]
         
         self.stdin_fd = sys.stdin.fileno()
-        self.translation_step = 0.0001
+        self.translation_step = 0.01  #0.0001
+        self.translation_delta = 0.01 #0.0001
         self.rotation_step = 0.0001
             
         self.publish_timer = self.create_timer(0.1, self.publish_tf)
@@ -70,7 +71,7 @@ class TransformController(Node):
         t.transform.rotation.w = orientation_quat[3]
         self.broadcaster.sendTransform(t)
         
-        print(f'position={self.position}, orientation={self.relative_orientation_quat}, orientation_quat={orientation_quat}', end='\r')  # Print on the same line
+        #print(f'position={self.position}, orientation_quat={orientation_quat}', end='\r')  # Print on the same line
         
 def read_input(self):
     while rclpy.ok():
@@ -107,9 +108,9 @@ def read_input(self):
                 elif ch == 'h':
                     self.change_wrt_world[2] -= self.rotation_step
                 elif ch == 'u':
-                    self.translation_step += 0.0001
+                    self.translation_step += self.translation_delta
                 elif ch == 'j':
-                    self.translation_step = max(0.0001, self.translation_step - 0.0001)
+                    self.translation_step = max(self.translation_delta, self.translation_step - self.translation_delta)
                 elif ch == 'ı':
                     self.rotation_step += 0.0001
                 elif ch == 'k':

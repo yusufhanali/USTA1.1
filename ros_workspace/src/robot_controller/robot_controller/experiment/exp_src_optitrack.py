@@ -9,6 +9,7 @@ import rclpy
 from rclpy.signals import SignalHandlerOptions
 
 from scipy.spatial.transform import Rotation as R
+import matplotlib.pyplot as plt
 
 from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Bool, Float32MultiArray
@@ -25,13 +26,16 @@ class ExperimentController(BreatheAndGazeController):
         self.handover_orientation = np.array([0.8001031, 0.3314136, 0.1913417, 0.4619398])
         self.handover_position = np.array([0.4, -0.6, 0.5])
         
+        use_mock_hand = False
         self.hand_frame = "rigid_body_9"
+        if use_mock_hand:
+            self.hand_frame = "mock_hand"
         self.hand_position_smoother = cf.VectorLinearFilter(alpha=0.1, dimension=3)
         
         while not self.tfBuffer.can_transform(self.world, self.hand_frame, rclpy.time.Time()):
             self.init_tf()
             self.get_logger().warn(f"Waiting for TF transform from {self.world} to {self.hand_frame}...")
-            time.sleep(0.5)
+            time.sleep(1.0)
         
         self.hand_position_smoother.set_value(self.get_hand_position_in_world()/self.hand_position_smoother.alpha)
     
@@ -305,7 +309,7 @@ class ExperimentController(BreatheAndGazeController):
 
     def hold_object(self, object_pose=None, speed=None, minimize_wrist_rotation=True):
         """
-        Return CubicSplineController that guides the robot to hold an object in the given pose at the given speed.
+        Hold an object in the given pose at the given speed.
 
         Args:
             object_pose (np.array, optional): The position and orientation in the base frame. Defaults to None.
@@ -360,6 +364,63 @@ class ExperimentController(BreatheAndGazeController):
         self.close_gripper()
         self.get_logger().info("Picked up the object.")
     
+    def create_hold_cnc(self, object_pose=None, speed=None, minimize_wrist_rotation=True):
+        """
+        Return cubic spline controller that guides the robot to hold an object in the given pose at the given speed.
+
+        Args:
+            object_pose (np.array, optional): The position and orientation in the base frame. Defaults to None.
+            speed (Float, optional): The speed at which the end effector would be moving. Defaults to None.
+        """
+        if speed is None:
+            speed = self.speed
+        
+        self.open_gripper_async()
+        
+        if object_pose is None:
+            object_pose = self.object_to_pick_up()
+            
+        if len(object_pose) == 7:
+            object_position = object_pose[:3]
+            object_orientation = object_pose[3:]
+        elif len(object_pose) == 3:
+            object_position = object_pose
+            object_orientation = self.camera_towards_board_quat
+        elif len(object_pose) == 16:
+            object_position = object_pose[:3, 3]
+            object_orientation_matrix = object_pose[:3, :3]
+            object_orientation = R.from_matrix(object_orientation_matrix).as_quat()
+        else:
+            self.get_logger().error(f"Invalid object_pose length: {len(object_pose)}. Expected either:\n3 (xyz),\n7 (xyz + xyzw),\n16 (4x4 homogeneous matrix).")
+            return
+        
+        if minimize_wrist_rotation:
+            #rotate around z by 180 degrees if necessary to prevent unnecessary wrist rotation
+            current_orientation_matrix = self.get_current_orientation()
+            object_orientation_matrix = R.from_quat(object_orientation).as_matrix()
+            object_orientation_matrix_rotated =  object_orientation_matrix @ R.from_euler('z', np.pi).as_matrix()
+            
+            current_to_object_orientation = R.from_matrix(current_orientation_matrix.T @ object_orientation_matrix).as_rotvec()
+            current_to_object_orientation_rotated = R.from_matrix(current_orientation_matrix.T @ object_orientation_matrix_rotated).as_rotvec()
+            current_to_object_orientation_norm = np.linalg.norm(current_to_object_orientation)
+            current_to_object_orientation_rotated_norm = np.linalg.norm(current_to_object_orientation_rotated)
+            
+            if current_to_object_orientation_rotated_norm < current_to_object_orientation_norm:
+                object_orientation = R.from_matrix(object_orientation_matrix_rotated).as_quat()
+        
+        current_position = self.get_current_coordinate()
+        movement_direction = (object_position - current_position) * [1.0, 1.0, 0.0]  # Only consider x and y for direction
+        movement_direction /= np.linalg.norm(movement_direction)
+        
+        hold_csc = self.create_cubic_spline_controller(start_point=current_position,
+                                                        end_point=object_position,
+                                                        start_derivative=movement_direction * 0.3,  # Example start derivative
+                                                        end_derivative=[0.0, 0.0, -0.4],  # Example end derivative
+                                                        desired_orientation=object_orientation,
+                                                        speed=speed)
+        
+        return hold_csc    
+    
     def place_object(self, recepticle_position=np.array([-0.3, 0.3, 0.2]), speed=None):
         if speed is None:
             speed = self.speed
@@ -375,7 +436,7 @@ class ExperimentController(BreatheAndGazeController):
         self.open_gripper()
         self.get_logger().info("Placed the object.")
 
-    def hand_object_over_to_table(self, handover_position=None, handover_orientation=None, speed=None): #TODO: make dynamic
+    def hand_object_over_to_table(self, handover_position=None, handover_orientation=None, speed=None):
         if speed is None:
             speed = self.speed
         if handover_position is None:
@@ -409,40 +470,47 @@ class ExperimentController(BreatheAndGazeController):
         
         self.close_gripper_async()
 
-    def calculate_handover_pose(self):
+    def calculate_downward_handover_pose(self):
         hand_in_base_position = self.get_hand_position_in_base()
-        hand_in_base_position[2] += 0.04  # Raise the hand position slightly to avoid collision
-        hand_in_base_position, handover_orientation = self.create_outwards_frame(hand_in_base_position)
+        hand_in_base_position[2] += 0.07  # Raise the hand position slightly to avoid collision
+        hand_in_world_position, handover_orientation_in_world = self.create_downwards_frame(hand_in_base_position)
+        hand_in_base_position = (self.world_to_base_homogeneous @ np.array([hand_in_world_position[0], hand_in_world_position[1], hand_in_world_position[2], 1.0]).T)[:3]
+        handover_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(handover_orientation_in_world).as_matrix()).as_quat()
         
         return hand_in_base_position, handover_orientation
+    
+    def calculate_outward_handover_pose(self):
+        hand_in_base_position = self.get_hand_position_in_base()
+        hand_in_base_position[2] += 0.025  # Raise the hand position slightly to avoid collision
+        hand_in_base_position, handover_orientation_in_base = self.create_outwards_frame(hand_in_base_position)
+        
+        return hand_in_base_position, handover_orientation_in_base
         
     def hand_object_over_to_hand_velocities(self, speed=None):
         if speed is None:
             speed = self.speed
         
-        hand_in_base_position, handover_orientation = self.calculate_handover_pose()
+        hand_in_base_position, handover_orientation = self.calculate_outward_handover_pose()
         
         current_position = self.get_current_coordinate()
         movement_direction = (hand_in_base_position - current_position) * [1.0, 1.0, 0.0]  # Only consider x and y for direction
         movement_direction /= np.linalg.norm(movement_direction)
         
-        print(f"speed: {speed}")
         cubic_spline_controller = self.create_cubic_spline_controller(start_point=current_position,
                                                                       end_point=hand_in_base_position,
-                                                                      start_derivative=movement_direction * 0.3,  # Example start derivative
+                                                                      start_derivative= [0.0, 0.0, 0.4],#movement_direction * 0.3,  # Example start derivative
                                                                       end_derivative=[0.0, 0.0, -0.2],  # Example end derivative
                                                                       desired_orientation=handover_orientation,
                                                                       speed=speed)
-        
         max_error = 0.001
         current_error = np.linalg.norm(hand_in_base_position - self.get_current_coordinate())
-        tick_counter = 0
+        tick_counter = 1
         while rclpy.ok() and current_error > max_error and cubic_spline_controller.t < 1.0:
-            if tick_counter % self.control_rate == 0:
+            if tick_counter % (self.control_rate//5) == 0:
                 tick_counter = 0
 
-                if current_error > 0.1: #stop once the eef is close enough to the hand, to avoid shaking
-                    hand_in_base_position, handover_orientation = self.calculate_handover_pose()
+                if current_error > 0.05: #stop once the eef is close enough to the hand, to avoid shaking
+                    hand_in_base_position, handover_orientation = self.calculate_outward_handover_pose()
                     cubic_spline_controller.set_end_point(hand_in_base_position)
                     cubic_spline_controller.set_desired_orientation(handover_orientation)
 
@@ -457,10 +525,28 @@ class ExperimentController(BreatheAndGazeController):
             tick_counter += 1
             self.ros_rate.sleep()
         
+        self.stop_movement()
         self.open_gripper()
+        
+        plt.plot(cubic_spline_controller.speed_scale_array, label="Speed Scale")
+        plt.plot(cubic_spline_controller.thres_scale_array, label="Threshold Scale")
+        plt.plot(cubic_spline_controller.speed_array, label="EEF Speed")
+        plt.plot(cubic_spline_controller.smoothed_speed_scale_array, label="Smoothed Speed Scale")
+        plt.title("Cubic Spline Controller Speed and Threshold Scales")
+        plt.xlabel("Time Step")
+        plt.ylabel("Scale Value")
+        plt.legend()
+        plt.show()
+        
         self.get_logger().info("Handed over the object to the hand.")
     
     def discover_and_hold_object(self, speed=None):
+        """
+        Discover an object and hold it.
+
+        Args:
+            speed (float, optional): The speed at which the robot will move. Defaults to controller speed.
+        """
         if speed is None:
             speed = self.speed
             
@@ -476,6 +562,31 @@ class ExperimentController(BreatheAndGazeController):
         pickup_pose = np.concatenate((object_position_in_base, pickup_orientation))
         
         self.hold_object(object_pose=pickup_pose, speed=speed, minimize_wrist_rotation=False)
+        
+    def discover_and_create_hold_cnc(self, speed=None):
+            """
+            Discover an object and return the cubic spline controller for holding it.
+    
+            Args:
+                speed (float, optional): The speed at which the robot will move. Defaults to controller speed.
+            """
+            if speed is None:
+                speed = self.speed
+                
+            object_position = self.object_to_pick_up()
+            if object_position is None:
+                self.get_logger().warn("Can't find and pick up object because no suitable object was found.")
+                return None
+            
+            object_position_in_base = (self.world_to_base_homogeneous @ np.array([object_position[0], object_position[1], object_position[2], 1.0]).T)[:3]
+            object_position_in_base[2] -= 0.04
+            pickup_orientation = self.create_downwards_frame(object_position_in_base)[1]
+            pickup_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(pickup_orientation).as_matrix()).as_quat()
+            pickup_pose = np.concatenate((object_position_in_base, pickup_orientation))
+            
+            hold_cnc = self.create_hold_cnc(object_pose=pickup_pose, speed=speed, minimize_wrist_rotation=False)
+
+            return hold_cnc
 
 
         
@@ -538,45 +649,74 @@ def observer(experiment_controller: ExperimentController = None, frequency: int 
         #print(f"Maximum allowed time: {1.0 / frequency * 1000:.2f} ms, Elapsed time in ms: {elapsed_time * 1000:.2f}", end="\r")
         sleep_time = max(0, (1.0 / frequency) - elapsed_time)
         time.sleep(sleep_time)
-         
+        
 def machine(experiment_controller: ExperimentController = None):  
-    state_0 = "breathing_gazing" 
-    state_1 = "picking_up"
+    state_0 = "breathing_gazing"
+    state_1 = "holding"
+    holding_csc = None
+    holding_max_error = 0.001
     state_2 = "placing"
-    state_3 = "handing_over"
+    placing_csc = None
+    state_3 = "handover_give"
+    handover_give_csc = None
+    state_4 = "handover_take"
+    handover_take_csc = None
     
-    state = 0
+    current_error = 0.0
+    
+    experiment_controller.open_gripper()
+    
+    state = 1
     while rclpy.ok():
-        if state == 1: # basically if in grasping mode
-            experiment_controller.hold_object(experiment_controller.grasp_pose)
-                
-            place_or_handover = input("Do you want to place the object or hand it over? (place/handover): ").strip().lower()
-            if place_or_handover == "handover":
-                handover_position = np.array([-0.14, -0.65, 0.02])  # Example handover position in base frame          
-                experiment_controller.hand_object_over(handover_position=handover_position)
-            else:
-                receptacle_position = np.array([-0.65, 0.09, 0.08])  # Example receptacle position in base frame
-                experiment_controller.place_object(recepticle_position=receptacle_position)
-                
-            experiment_controller.set_breathing_gazing(go_home=True, go_home_speed=0.5)
-            state = 0
+        joint_velocities = np.zeros(6)
+        
+        if state == 0:
+            joint_velocities = experiment_controller.breathe_and_gaze_step()
+        
+        elif state == 1:
+            if holding_csc == None:
+                holding_csc = experiment_controller.discover_and_create_hold_cnc()
             
-        elif state == 0: # handover test   
+            velocity_command = holding_csc.get_cubic_velocities()
+                        
+            pinv_jacobian = experiment_controller.get_inverse_jacobian()
+            joint_velocities = pinv_jacobian @ velocity_command
             
-            experiment_controller.discover_and_hold_object()
-            experiment_controller.raise_eef(0.002, speed=0.05)
+            current_error = np.linalg.norm(holding_csc.end_point - experiment_controller.get_current_coordinate())
+            #print(f"current_error: {current_error:.4f}, holding_csc.t: {holding_csc.t:.4f}", end="\r")
             
-            experiment_controller.hand_object_over_to_hand_velocities(speed=0.2)
+            if current_error < holding_max_error or holding_csc.t >= 1.0:
+                experiment_controller.stop_movement()                              
+                joint_velocities = np.zeros(6)
+                experiment_controller.close_gripper()
+                experiment_controller.raise_eef(height=0.01, speed=0.1)
+                holding_csc = None  
+                state = 3
+                experiment_controller.get_logger().info("Holding state completed.")
+        
+        elif state == 2:
+            pass
+        
+        elif state == 3:
+            experiment_controller.hand_object_over_to_hand_velocities()
             
+            experiment_controller.stop_movement()
+            
+            state = 5
+            joint_velocities = np.zeros(6)
+            continue
+            experiment_controller.set_breathing_gazing()
+            experiment_controller.get_logger().info("Handover completed. Returning to breathing and gazing state.")
+        
+        elif state == 4:
+            pass
+        
+        elif state == 5:
+            experiment_controller.stop_movement()
             return
-            
-            experiment_controller.publish_velocity_command(total_velocities)
-            experiment_controller.ros_rate.sleep()
-
-            #experiment_controller.discover_and_hold_object()
-            #return
-            
-            
+        
+        experiment_controller.publish_velocity_command(joint_velocities)
+        experiment_controller.ros_rate.sleep()    
     
     
 def main(args=None):
@@ -592,7 +732,7 @@ def main(args=None):
         
         print("Starting main.")
                    
-        experiment_controller.start_controller(speed=0.3, go_home=True)
+        experiment_controller.start_controller(speed=0.6, go_home=True)
                          
         machine(experiment_controller)
         

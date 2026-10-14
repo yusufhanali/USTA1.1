@@ -63,11 +63,15 @@ class GripperController:
         return self.gripper.get_current_position()
 
 class CubicSplineController():    
-    def rotation_vector(self, desired_orientation):
-        current_orientation = self.robot.get_current_orientation()
+    def rotation_vector(self, desired_orientation, start_orientation=None):
+        if start_orientation is None:
+            start_orientation_matrix = self.robot.get_current_orientation()
+        else:
+            start_orientation_matrix = linalg_utils.quaternion_to_rotation_matrix(start_orientation) if len(start_orientation) == 4 else start_orientation
+        
         desired_orientation_matrix = linalg_utils.quaternion_to_rotation_matrix(desired_orientation) if len(desired_orientation) == 4 else desired_orientation
-        current_to_desired = desired_orientation_matrix @ current_orientation.T
-        rotvec = linalg_utils.rotation_matrix_to_rotvec(current_to_desired)
+        start_to_desired = desired_orientation_matrix @ start_orientation_matrix.T
+        rotvec = linalg_utils.rotation_matrix_to_rotvec(start_to_desired)
         return rotvec
 
     def __init__(self, robot, start_point, end_point, start_derivative, end_derivative, desired_orientation = None, speed = 0.05, control_rate = 500):
@@ -79,15 +83,15 @@ class CubicSplineController():
         self.end_derivative = end_derivative
         self.desired_orientation = desired_orientation
         self.desired_orientation_changed = False
-        self.speed = speed if speed < 0.8 else 0.8
+        self.speed = speed if speed < 0.9 else 0.9
         self.control_rate = control_rate  # Hz
 
-        self.slow_start_threshold = 0.15
-        self.slow_end_threshold = 0.15
+        self.slow_start_threshold = 0.01
+        self.slow_end_threshold = self.speed * self.speed
 
         self.t = 0.0
 
-        self.tick_counter = 0
+        self.tick_counter = 1
         self.slow_calculation_tick_threshold = 25
 
         self.x_coordinate, \
@@ -95,9 +99,20 @@ class CubicSplineController():
         self.z_coordinate, \
         self.x_derivative, \
         self.y_derivative, \
-        self.z_derivative = self.calculate_cubic_spline_equations()
+        self.z_derivative, \
+        self.x_second_derivative, \
+        self.y_second_derivative, \
+        self.z_second_derivative = self.calculate_cubic_spline_equations()
         self.robot.publish_marker_array(self.trajectory_MarkerArray())
+        #self.robot.publish_marker_array(self.derivatives_MarkerArray())
         
+        self.speed_scale_smoother = control_and_filters.LinearFilter(alpha=7/self.control_rate)
+        
+        self.speed_scale_array = []
+        self.smoothed_speed_scale_array = []
+        self.thres_scale_array = []
+        self.speed_array = []
+                
         self.trajectory_length = self.calculate_curve_length()
         self.distance_traveled = 0.0
                 
@@ -113,6 +128,17 @@ class CubicSplineController():
         self.rotation_reached = False
         
         self.current_error = 0.0
+        
+        v = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
+        a = np.array([self.x_second_derivative(self.t), self.y_second_derivative(self.t), self.z_second_derivative(self.t)])
+        
+        v_norm = np.linalg.norm(v)
+        norm_T_prime = np.linalg.norm(np.cross(v, a)) / (v_norm ** 2)
+        speed_scale = 1/(1 + norm_T_prime)
+                
+        speed_scale = min(speed_scale, 1.0)
+        speed_scale *= self.calculate_threshold_based_speed_scaler()
+        self.speed_scale_smoother.set_value(speed_scale)
 
 
     def calculate_rotation_speed(self, desired_orientation, remaining_time):
@@ -143,8 +169,12 @@ class CubicSplineController():
         x_derivatives = lambda t: 3*x_coeff[0]*t**2 + 2*x_coeff[1]*t + x_coeff[2]
         y_derivatives = lambda t: 3*y_coeff[0]*t**2 + 2*y_coeff[1]*t + y_coeff[2]
         z_derivatives = lambda t: 3*z_coeff[0]*t**2 + 2*z_coeff[1]*t + z_coeff[2]
-    
-        return x_coordinates, y_coordinates, z_coordinates, x_derivatives, y_derivatives, z_derivatives
+        
+        x_second_derivatives = lambda t: 6*x_coeff[0]*t + 2*x_coeff[1]
+        y_second_derivatives = lambda t: 6*y_coeff[0]*t + 2*y_coeff[1]
+        z_second_derivatives = lambda t: 6*z_coeff[0]*t + 2*z_coeff[1]
+        
+        return x_coordinates, y_coordinates, z_coordinates, x_derivatives, y_derivatives, z_derivatives, x_second_derivatives, y_second_derivatives, z_second_derivatives
     
     def calculate_remaining_trajectory_length(self, num_points=400, start_t=None, x_coordinate=None, y_coordinate=None, z_coordinate=None):
         if start_t is None:
@@ -203,31 +233,71 @@ class CubicSplineController():
         
         return length / speed if speed > 0 else 5
 
+    def calculate_threshold_based_speed_scaler(self):
+        speed_scale = 1.0
+        remaining_length = max(self.trajectory_length - self.distance_traveled, 0.0)
+        if self.distance_traveled < self.slow_start_threshold:
+            speed_scale = max((self.distance_traveled / self.slow_start_threshold), 0.35)
+        if remaining_length < self.slow_end_threshold:
+            speed_scale = max((remaining_length / self.slow_end_threshold), 0.1)
 
+        return speed_scale
+
+    def calculate_second_derivative_based_speed_scaler(self):
+        v = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
+        a = np.array([self.x_second_derivative(self.t), self.y_second_derivative(self.t), self.z_second_derivative(self.t)])
+        
+        v_norm = np.linalg.norm(v)
+        if v_norm > 1e-5:
+            norm_T_prime = np.linalg.norm(np.cross(v, a)) / (v_norm ** 2)
+        else:
+            norm_T_prime = 0.0
+        speed_scale = 1/(1 + norm_T_prime)
+                
+        speed_scale *= 2
+        speed_scale = min(speed_scale, 1.0)
+        speed_scale *= self.calculate_threshold_based_speed_scaler()
+        self.speed_scale_array.append(speed_scale)
+        self.thres_scale_array.append(self.calculate_threshold_based_speed_scaler())
+        speed_scale = self.speed_scale_smoother.filter(speed_scale)
+        self.smoothed_speed_scale_array.append(speed_scale)
+        
+        return speed_scale
+
+    
     def set_end_point(self, new_end_point):
+        if np.linalg.norm(new_end_point - self.end_point) < 0.04: # If the new end point is very close to the current end point, we don't need to update it
+            return
+        
         self.end_point = new_end_point
         self.end_point_changed = True
     
     def set_desired_orientation(self, new_desired_orientation):
+        if self.desired_orientation is not None and np.linalg.norm(self.rotation_vector(new_desired_orientation, start_orientation=self.desired_orientation)) < 0.04: # If the new desired orientation is very close to the current desired orientation, we don't need to update it
+            return
+        
         self.desired_orientation = new_desired_orientation
         self.desired_orientation_changed = True
         self.rotation_reached = False
 
-    def refresh_derivatives(self):        
+
+    def refresh_derivatives(self):
         start_point = self.robot.get_current_coordinate()
 
-        remaining_distance = np.linalg.norm(self.end_point - start_point)        
-        eef_velocity = self.robot.get_current_eef_velocity()
-        current_speed = np.linalg.norm(eef_velocity)
-        if current_speed > 1e-6:
-            tangent_magnitude = remaining_distance * 1.5 
-            start_derivative = (eef_velocity / current_speed) * tangent_magnitude
+        remaining_distance = np.linalg.norm(self.end_point - start_point)   
+        tangent_magnitude = remaining_distance * 1.0  # Adjust this factor to control the magnitude of the tangent vectors
+
+        velocity_desired = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
+        param_derivative_norm = np.linalg.norm(velocity_desired)
+        if param_derivative_norm > 1e-6:
+            normalized_derivative = velocity_desired / param_derivative_norm
+            start_derivative = normalized_derivative * tangent_magnitude
         else:
             start_derivative = np.zeros(3)
             
         end_deriv_norm = np.linalg.norm(self.end_derivative)
         if end_deriv_norm > 1e-6:
-            safe_end_derivative = (self.end_derivative / end_deriv_norm) * (remaining_distance * 1.5)
+            safe_end_derivative = (self.end_derivative / end_deriv_norm) * tangent_magnitude
         else:
             safe_end_derivative = np.zeros(3)
         
@@ -249,7 +319,13 @@ class CubicSplineController():
         self.y_derivative = here_to_end_equations[4]
         self.z_derivative = here_to_end_equations[5]
         
-    def get_cubic_velocities(self, speed_multiplier = 1.0, max_error = 0.001):
+        self.x_second_derivative = here_to_end_equations[6]
+        self.y_second_derivative = here_to_end_equations[7]
+        self.z_second_derivative = here_to_end_equations[8]
+
+        self.trajectory_length = self.distance_traveled + self.calculate_curve_length()
+                    
+    def get_cubic_velocities(self, speed_multiplier = 1.0, max_error = 0.003):
         if self.t >= 1.0:
             return np.zeros(6)
            
@@ -270,6 +346,8 @@ class CubicSplineController():
                     
             if self.desired_orientation_changed or self.end_point_changed or (self.current_error > max_error and self.t > 0.5 and self.t < 0.95):
                 self.refresh_derivatives()
+                self.desired_orientation_changed = False
+                self.end_point_changed = False
               
         velocity_desired = np.array([self.x_derivative(self.t), self.y_derivative(self.t), self.z_derivative(self.t)])
         param_derivative_norm = np.linalg.norm(velocity_desired)
@@ -277,28 +355,32 @@ class CubicSplineController():
         if param_derivative_norm < 1e-5:
             self.t = 1.0
             return np.zeros(6)
+        normalized_derivative = velocity_desired / param_derivative_norm
 
-        desired_linear_speed = (velocity_desired / np.linalg.norm(velocity_desired)) * self.speed
-        linear_speed_scale = 1.0
-        remaining_length = max(self.trajectory_length - self.distance_traveled, 0.0)
-        if self.distance_traveled < self.slow_start_threshold:
-            linear_speed_scale = max((self.distance_traveled / self.slow_start_threshold), 0.4)
-        if remaining_length < self.slow_end_threshold:
-            linear_speed_scale = max((remaining_length / self.slow_end_threshold), 0.4)
-            
-        desired_linear_speed *= linear_speed_scale
+        desired_linear_speed = normalized_derivative * self.speed
         
-        desired_speed = np.concatenate((desired_linear_speed, self.desired_rot_speed))
+        speed_scale = self.calculate_second_derivative_based_speed_scaler()
+
+        #print(f"scale: {speed_scale:.3f}, travelled: {self.distance_traveled:.3f}, trajlen: {self.trajectory_length:.3f}", end="\r")
+        desired_linear_speed *= speed_scale
+        desired_rot_speed = self.desired_rot_speed * speed_scale
+        
+        curr_corr = self.robot.get_current_coordinate()
+        self.robot.publish_arrow(start_pos=curr_corr, end_pos=curr_corr + desired_linear_speed, color=(0.0, 1.0, 0.0, 1.0), id=789)
+        
+        desired_speed = np.concatenate((desired_linear_speed, desired_rot_speed))
         desired_speed *= speed_multiplier
-        
+                
         curr_speed = np.linalg.norm(desired_speed[:3])
         self.distance_traveled += curr_speed / self.control_rate
-                        
-        self.current_error = np.linalg.norm(self.robot.get_current_coordinate() - np.array([self.x_coordinate(self.t), self.y_coordinate(self.t), self.z_coordinate(self.t)])) 
+              
+        self.current_error = np.linalg.norm(self.robot.get_current_coordinate() - np.array([self.x_coordinate(self.t), self.y_coordinate(self.t), self.z_coordinate(self.t)]))
         self.t += (curr_speed) / (np.linalg.norm(velocity_desired) * self.control_rate)
         self.t = min(self.t, 1.0)
-        
+                
         self.tick_counter += 1
+        
+        self.speed_array.append(np.linalg.norm(desired_speed[:3]))
                 
         return desired_speed
     
@@ -389,7 +471,7 @@ class CubicSplineController():
             marker_array.markers.append(arrow_marker)
         
         return marker_array
-
+    
 
 class NewController(Node):
 
@@ -665,6 +747,12 @@ class NewController(Node):
         soft_start_stop_filter = control_and_filters.WedgeShapedScaler(min_input=0.0, max_input=position_error, entry_distance=0.2*position_error, exit_distance=0.2*position_error, peak_output=1.0, min_output=0.25)
         
         while position_error > 0.002:
+            trajectory = desired_joint_positions - self.joint_states_global["pos"]      
+            norm = np.linalg.norm(desired_joint_positions - self.joint_states_global["pos"])        
+            delta_t = norm/speed
+                    
+            velocity_command = trajectory / delta_t
+            
             position_error = np.linalg.norm(desired_joint_positions - self.joint_states_global["pos"])
             speed_scale = soft_start_stop_filter.scale(position_error)
             self.publish_velocity_command(velocity_command * speed_scale)
