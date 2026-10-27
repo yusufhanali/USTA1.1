@@ -17,8 +17,8 @@ JOINT_LIMITS = np.array([
 
 JOINT_VELOCITY_LIMITS = np.array([
             3,  # Joint 1 velocity limits
-            3,  # Joint 2 velocity limits
-            3,  # Joint 3 velocity limits
+            2,  # Joint 2 velocity limits
+            2,  # Joint 3 velocity limits
             3,  # Joint 4 velocity limits
             3,  # Joint 5 velocity limits
             3   # Joint 6 velocity limits

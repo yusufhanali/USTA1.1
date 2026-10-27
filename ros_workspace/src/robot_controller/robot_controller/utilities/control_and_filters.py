@@ -100,6 +100,47 @@ class LinearScaler:
         else:
             return ((value - self.min_input) / (self.input_range)) * (self.output_range) + self.min_output
     
+class ExponentialScaler:
+    def __init__(self, base=2.0, min_input=0.0, max_input=1.0, min_output=0.0, max_output=1.0):
+        self.base = base
+        self.min_input = min_input
+        self.max_input = max_input
+        self.min_output = min_output
+        self.max_output = max_output
+        
+        self.input_range = max_input - min_input
+        self.output_range = max_output - min_output
+        
+    def scale(self, value):
+        if value < self.min_input:
+            return self.min_output
+        elif value > self.max_input:
+            return self.max_output
+        else:
+            normalized_value = (value - self.min_input) / (self.input_range)
+            exp_value = (self.base ** normalized_value - 1) / (self.base - 1)
+            return exp_value * (self.output_range) + self.min_output
+    
+class ParabolicScaler:
+    def __init__(self, min_input=0.0, max_input=1.0, min_output=0.0, max_output=1.0):
+        self.min_input = min_input
+        self.max_input = max_input
+        self.min_output = min_output
+        self.max_output = max_output
+        
+        self.input_range = max_input - min_input
+        self.output_range = max_output - min_output
+        
+    def scale(self, value):
+        if value < self.min_input:
+            return self.min_output
+        elif value > self.max_input:
+            return self.max_output
+        else:
+            normalized_value = (value - self.min_input) / (self.input_range)
+            parabolic_value = normalized_value ** 2
+            return parabolic_value * (self.output_range) + self.min_output
+    
 class WedgeShapedScaler:
     def __init__(self, min_input=0.0, max_input=1.0, entry_distance=0.2, exit_distance=0.2, peak_output=1.0, min_output=0.0):
         self.min_input = min_input

@@ -90,6 +90,10 @@ class UR5eWatchdog(Node):
     def init_temp_stuff(self):
         pass
     
+    def init_singularity_stuff(self):
+        self.sigma_caution_threshold = 0.10
+        self.sigma_critical_threshold = 0.03
+        
     def __init__(self, name = "ur5e_watchdog"):
         super().__init__(name)
         
@@ -99,6 +103,9 @@ class UR5eWatchdog(Node):
         # Initialize control rate
         self.control_rate = 500 # Hz
         self.ros_rate = self.create_rate(self.control_rate, self.get_clock())
+        
+        self.current_jacobian = np.eye(6)
+        self.current_jacobian_inverse = np.eye(6)
         
         self.base = "base"
         self.eef = "wrist_3_link"
@@ -110,6 +117,7 @@ class UR5eWatchdog(Node):
         self.init_velocity_controller()        
         self.init_tf()
         self.init_camera_parameters()
+        self.init_singularity_stuff()
         
         self.init_temp_stuff()
         
@@ -194,8 +202,13 @@ class UR5eWatchdog(Node):
         '''
         #self.constraint_functions.append(self.height_constraint)
         self.constraint_functions.append(self.joint_velocity_constraint)
+        self.get_logger().info("Registered joint_velocity_constraint")
         self.constraint_functions.append(self.joint_limit_constraint)
+        self.get_logger().info("Registered joint_limit_constraint")
+        self.constraint_functions.append(self.singularity_constraint)
+        self.get_logger().info("Registered singularity_constraint")
         self.constraint_functions.append(self.camera_collision_constraint)
+        self.get_logger().info("Registered camera_collision_constraint")
         
     def height_constraint(self, commanded_velocity):
         max_z = 0.85
@@ -203,7 +216,7 @@ class UR5eWatchdog(Node):
         
         caution_distance = 0.1
         
-        cartesian_velocity = self.get_jacobian_matrix() @ commanded_velocity
+        cartesian_velocity = self.current_jacobian @ commanded_velocity
         
         current_z = self.get_current_coordinate()[2]
         commanded_z = current_z + cartesian_velocity[2] * (1 / self.control_rate)
@@ -227,7 +240,7 @@ class UR5eWatchdog(Node):
         else:
             return commanded_velocity
         
-        altered_velocity = self.get_inverse_jacobian() @ cartesian_velocity
+        altered_velocity = self.current_jacobian_inverse @ cartesian_velocity
         return altered_velocity
        
     def joint_velocity_constraint(self, commanded_velocity):
@@ -267,7 +280,46 @@ class UR5eWatchdog(Node):
                     altered_velocity[i] = ((commanded_joint_positions[i] - joint_limits[i][0]) / caution_angle) * command
                     
         return altered_velocity
-               
+
+    def singularity_constraint(self, commanded_velocity):
+        sigma_values = np.linalg.svd(self.current_jacobian, compute_uv=False)
+        sigma_current = sigma_values[-1]
+        
+        # 1. Define speed limits (rad/s)
+        limit_scale_max = 1.0
+        limit_scale_min = 0.1
+        
+        # 2. Smoothly calculate the speed ceiling based on sigma
+        if sigma_current >= self.sigma_caution_threshold:
+            allowed_limit_scale = limit_scale_max
+        elif sigma_current <= self.sigma_critical_threshold:
+            allowed_limit_scale = limit_scale_min
+        else:
+            # Smooth interpolation between v_max_near and v_max_normal
+            ratio = (sigma_current - self.sigma_critical_threshold) / (self.sigma_caution_threshold - self.sigma_critical_threshold)
+            allowed_limit_scale = limit_scale_min + ratio * (limit_scale_max - limit_scale_min)
+        # 3. Check if motion is escaping
+        dt = 0.02
+        q_next = self.get_joint_pos() + commanded_velocity * dt
+        sigma_next = np.linalg.svd(ur5e_kinematics.get_jacobian(q_next.tolist()), compute_uv=False)[-1]
+        
+        if sigma_next <= sigma_current and sigma_current <= self.sigma_critical_threshold:
+            # Moving deeper into critical limit -> absolute stop
+            return np.zeros_like(commanded_velocity)
+            
+        # If escaping, allow a controlled, safe exit speed (e.g., capped at 0.4 rad/s)
+        if sigma_next > sigma_current and sigma_current < self.sigma_caution_threshold:
+            allowed_limit_scale = max(allowed_limit_scale, 0.25)
+        # 4. DIRECTION-PRESERVING SPEED CLAMP:
+        # If any joint exceeds allowed_speed, scale the ENTIRE vector down uniformly
+        
+        applied_scale = 1.0
+        for i, speed in enumerate(commanded_velocity):
+            if abs(speed) > ur5e_kinematics.JOINT_VELOCITY_LIMITS[i]*allowed_limit_scale:
+                applied_scale = min(applied_scale, ur5e_kinematics.JOINT_VELOCITY_LIMITS[i]*allowed_limit_scale / abs(speed))
+
+        return commanded_velocity * applied_scale
+
     def camera_collision_constraint(self, commanded_velocity):
         # Thresholds (meters)
         d_min = 0.015       # Safety boundary (1.5 cm)
@@ -359,7 +411,10 @@ class UR5eWatchdog(Node):
     def loop(self):
         self.get_logger().info("Watchdog loop started.")
 
-        while rclpy.ok():            
+        while rclpy.ok():
+            self.current_jacobian = self.get_jacobian_matrix()
+            self.current_jacobian_inverse = self.get_inverse_jacobian()
+                      
             self.constrain_and_publish_velocity_command(self.current_velocity_command.copy())
 
             self.ros_rate.sleep()

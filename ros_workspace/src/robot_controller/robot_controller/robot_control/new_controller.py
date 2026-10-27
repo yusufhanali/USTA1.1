@@ -107,11 +107,6 @@ class CubicSplineController():
         #self.robot.publish_marker_array(self.derivatives_MarkerArray())
         
         self.speed_scale_smoother = control_and_filters.LinearFilter(alpha=7/self.control_rate)
-        
-        self.speed_scale_array = []
-        self.smoothed_speed_scale_array = []
-        self.thres_scale_array = []
-        self.speed_array = []
                 
         self.trajectory_length = self.calculate_curve_length()
         self.distance_traveled = 0.0
@@ -257,10 +252,7 @@ class CubicSplineController():
         speed_scale *= 2
         speed_scale = min(speed_scale, 1.0)
         speed_scale *= self.calculate_threshold_based_speed_scaler()
-        self.speed_scale_array.append(speed_scale)
-        self.thres_scale_array.append(self.calculate_threshold_based_speed_scaler())
         speed_scale = self.speed_scale_smoother.filter(speed_scale)
-        self.smoothed_speed_scale_array.append(speed_scale)
         
         return speed_scale
 
@@ -379,9 +371,7 @@ class CubicSplineController():
         self.t = min(self.t, 1.0)
                 
         self.tick_counter += 1
-        
-        self.speed_array.append(np.linalg.norm(desired_speed[:3]))
-                
+                        
         return desired_speed
     
     
@@ -702,7 +692,10 @@ class NewController(Node):
                                             msg.effort[4]])         
     
         
-    def open_gripper(self, speed=255, force=255):
+    def open_gripper(self, speed=255, force=255, wait_time=0.0):
+        if wait_time > 0.0:
+            time.sleep(wait_time)
+        
         self.gripper.open(speed, force)
         self.get_logger().info("Gripper opened.")
         
@@ -710,7 +703,10 @@ class NewController(Node):
         self.gripper.open_async(speed, force)
         self.get_logger().info("Gripper opening asynchronously.")
         
-    def close_gripper(self, speed=255, force=255):
+    def close_gripper(self, speed=255, force=255, wait_time=0.0):
+        if wait_time > 0.0:
+            time.sleep(wait_time)
+            
         self.gripper.close(speed, force)
         self.get_logger().info("Gripper closed.")
         
