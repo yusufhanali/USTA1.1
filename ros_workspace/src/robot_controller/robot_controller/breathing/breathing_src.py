@@ -21,6 +21,7 @@ class Breather:
         except:
             self.freq = 0.25
             print(f"freq is not given in the breathe dict. It is set to {self.freq}")
+        self.freq_initial = self.freq
 
         # Give index for each data point to interpolate in the main loop
         self.num_of_vel_pts = self.f.shape[0]
@@ -31,15 +32,20 @@ class Breather:
         except:
             self.amplitude = 2.0
             print(f"amplitude is not given in the breathe dict. It is set to {self.amplitude}")
+        self.amplitude_initial = self.amplitude
+        
+        self.freq_times_amp = self.freq * self.amplitude
 
         self.loop_index = 0
+        self.prev_loop_index = 0
         self.breathe_count = 0
                 
-        self.initial_wrist_position = ur5e_kinematics.shoulder_to_base_translation_x_z(joint_positions)
+        self.initial_wrist_position = np.array([0.37, 0.33]) #ur5e_kinematics.shoulder_to_base_translation_x_z(joint_positions)
         self.difference_x_filter = control_and_filters.LinearFilter(alpha=0.1)
-        self.correction_factor_x = 8
+        self.correction_factor_x = 3
         self.correction_z = 0.0
-        self.z_PID = PIDController(kp=0.20, ki=0.15, kd=0.0, dt=1/self.control_rate)
+        self.ki_base = 0.15
+        self.z_PID = PIDController(kp=0.20, ki=self.ki_base, kd=0.0, dt=1/self.control_rate)
 
     def step_breathe(self, joint_positions, forward_movement=0.0):
         
@@ -61,6 +67,7 @@ class Breather:
     
     def reset(self):
         self.loop_index = 0
+        self.prev_loop_index = 0
         self.breathe_count = 0
     
     def step(self, joint_positions, forward_movement=0.0):
@@ -69,20 +76,26 @@ class Breather:
 
         self.loop_index = self.loop_index + (self.num_of_vel_pts/self.control_rate)*self.freq 
         self.loop_index = self.loop_index % self.num_of_vel_pts
-        if int(self.loop_index) == 0:
-            if self.breathe_count == 0:
-                self.initial_wrist_position = ur5e_kinematics.shoulder_to_base_translation_x_z(joint_positions)
-            else:
-                self.correction_z = self.z_PID.compute(setpoint=ur5e_kinematics.shoulder_to_base_translation_x_z(joint_positions)[1], measured_value= self.initial_wrist_position[1])
-                #print(f"Breath number {self.breathe_count}, correction in z direction: {self.correction_z:.4f} m/s")
+        crossed_zero = (self.loop_index < self.prev_loop_index)  # modulo wrapped
+        if crossed_zero:
+            self.correction_z = self.z_PID.compute(setpoint=ur5e_kinematics.shoulder_to_base_translation_x_z(joint_positions)[1], measured_value= self.initial_wrist_position[1])
+            #print(f"Breath number {self.breathe_count}, correction in z direction: {self.correction_z:.4f} m/s")
             self.breathe_count += 1
-            self.loop_index = 1
-            # print(f"Breathe count: {self.breathe_count}")
+        self.prev_loop_index = self.loop_index
 
         return velocity_command, velocity_task, corr, self.correction_z
     
     def set_frequency(self, freq):
         self.freq = freq
+        self.z_PID.ki = self.ki_base * self.freq / self.freq_initial
+        
+    def scale_frequency(self, scale):
+        self.freq = self.freq_initial * scale
+        self.z_PID.ki = self.ki_base * self.freq / self.freq_initial
+        
+    def set_only_frequency(self, freq):
+        self.freq = freq
+        self.z_PID.ki = self.ki_base * self.freq / self.freq_initial
         
     def set_amplitude(self, amplitude):
         self.amplitude = amplitude

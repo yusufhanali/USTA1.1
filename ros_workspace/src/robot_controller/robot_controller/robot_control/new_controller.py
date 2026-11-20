@@ -500,7 +500,7 @@ class NewController(Node):
                     tf_trans = np.array([tf.translation.x, tf.translation.y, tf.translation.z])
                     homog = linalg_utils.quaternion_to_homogeneous_matrix(tf_quat, tf_trans)
                     #sometimes an error occurs in the tf tree, and the transform from world to base_link is identity. In that case, we need to reinitialize the tfBuffer and tfListener until the tf tree is fixed.
-                    if np.equal(homog, np.eye(4)).all():
+                    if np.equal(homog, np.eye(4)).all() or np.linalg.norm(tf_trans) < 0.01: # If the transform is identity or very close to it, we consider it invalid
                         self.tfBuffer = Buffer()
                         self.tfListener = TransformListener(self.tfBuffer, self)
                         can_transform = False   
@@ -547,6 +547,8 @@ class NewController(Node):
         self.init_gripper()
         self.init_tf()
         
+        self.init_log_buffers()
+        
         self.base_to_world_homogeneous = np.array([ # WAS THIS WRONG BEFORE??? THE SIGNS ARE OPPOSITE NOW, LOOK INTO IT
             [-0.7071068, 0.7071068, 0.0, 1.7513],
             [-0.7071068, -0.7071068, 0.0, 0.0955],
@@ -565,13 +567,14 @@ class NewController(Node):
         self.first_movement = True        
         self.prev_velocities = np.zeros(6)
         
-        self.home_pos = np.array([-0.8, -1.73, -2.1,  1.1,  1.52, -np.pi])
+        self.home_pos = np.array([-0.8 + np.pi/2 - 0.3, -1.73, -2.1,  1.1,  1.52, -np.pi])
         self.gripper_length = 0.17
         
         self.marker_array_publisher = self.create_publisher(MarkerArray, "vis_marker_array", 10)
         self.marker_publisher = self.create_publisher(Marker, "vis_marker", 10)
         
         self.speed = 0.05
+        self.max_speed = 0.05
                 
         self.movement_stop_threshold = 0.007
         
@@ -584,6 +587,9 @@ class NewController(Node):
         self.joint_velocities_sent = []
         self.joint_velocities_real = []
         self.log_joint_velocities = False
+        
+        self.eef_velocities_sent = []
+        self.log_eef_velocities = False
         
         self.end_effector_poses = []
         self.log_end_effector_poses = False
@@ -661,7 +667,13 @@ class NewController(Node):
          
         vels += self.joint_velocity_additive_modifier
          
-        vels = self.filter_joint_velocities(vels)      
+        vels = self.filter_joint_velocities(vels)
+        
+        if self.log_joint_velocities:                              
+            self.joint_velocities_sent.append(vels)
+            self.joint_velocities_real.append(self.joint_states_global["vels"])
+        if self.log_end_effector_poses:
+            self.end_effector_poses.append(self.get_current_coordinate())
 
         vel_msg = Float64MultiArray()
         vel_msg.data = vels
@@ -1089,15 +1101,33 @@ class NewController(Node):
                 plt.tight_layout()
                 #plt.show(block=False)
 
+        if hasattr(self, 'eef_velocities_sent') and len(self.eef_velocities_sent) > 0:        
+            self.eef_velocities_sent = np.array(self.eef_velocities_sent)
+            plt.figure(self.figure_index)
+            self.figure_index += 1
+            eef_velocity_magnitudes = np.linalg.norm(self.eef_velocities_sent, axis=1)
+            plt.plot(eef_velocity_magnitudes, label="EEF Velocity Magnitude")
+            plt.title("End Effector Velocity Magnitude Over Time")
+            plt.xlabel("Time Step")
+            plt.ylabel("Velocity (m/s or rad/s)")
+            plt.legend()
+            #plt.show(block=False)
+
     def show_log_plots(self):
         self.prepare_log_plots()
         
         if self.figure_index > 0:
             plt.show()
         
+    
+    def scale_speeds(self, scale=1.0):
+        self.speed = self.max_speed * scale
+        self.speed_scale = scale
+        
     def start_controller(self, speed=0.3, go_home=True):
         self.speed = speed
-        self.init_log_buffers()
+        self.max_speed = speed
+        self.speed_scale = 1.0
         
         self.get_logger().info(f"Controller started with speed: {self.speed}")
         

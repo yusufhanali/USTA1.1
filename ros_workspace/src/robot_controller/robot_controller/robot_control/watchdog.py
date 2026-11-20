@@ -90,9 +90,24 @@ class UR5eWatchdog(Node):
     def init_temp_stuff(self):
         pass
     
+    def init_wrist1_height_stuff(self):
+        self.wrist1_min_height = 0.15
+        self.wrist1_caution_distance = 0.05
+        
+        self.wrist1_caution_scaler = control_and_filters.LinearScaler(min_input=self.wrist1_min_height, max_input=self.wrist1_min_height+self.wrist1_caution_distance, min_output=0.1, max_output=1.0)
+    
     def init_singularity_stuff(self):
         self.sigma_caution_threshold = 0.10
         self.sigma_critical_threshold = 0.03
+    
+    def init_workspace_stuff(self):
+        x_min, x_max = -1.0, 0.9
+        y_min, y_max = -0.7, 0.7
+        z_min, z_max = 0.0, 2.0
+        self.boundary_margin = 0.1
+        
+        self.rotate_45 = R.from_euler('z', 45, degrees=True).as_matrix()
+        self.bounds = [(x_min, x_max), (y_min, y_max), (z_min, z_max)]
         
     def __init__(self, name = "ur5e_watchdog"):
         super().__init__(name)
@@ -117,8 +132,9 @@ class UR5eWatchdog(Node):
         self.init_velocity_controller()        
         self.init_tf()
         self.init_camera_parameters()
+        self.init_workspace_stuff()
         self.init_singularity_stuff()
-        
+        self.init_wrist1_height_stuff()
         self.init_temp_stuff()
         
         self.base_to_world_homogeneous = np.array([ # WAS THIS WRONG BEFORE??? THE SIGNS ARE OPPOSITE NOW, LOOK INTO IT
@@ -132,6 +148,7 @@ class UR5eWatchdog(Node):
         
         self.prev_velocities = np.zeros(6)
         self.current_velocity_command = np.zeros(6)
+        self.current_position = np.zeros(3)
                         
         self.constraint_functions = []  # List to hold registered constraint functions
         self.constraint_register()  # Call the method to register constraints
@@ -200,7 +217,10 @@ class UR5eWatchdog(Node):
         '''
             Use this function to register all the constraints that you want to apply to the robot. This function is called in the constructor of the class.
         '''
-        #self.constraint_functions.append(self.height_constraint)
+        self.constraint_functions.append(self.wrist1_height_constraint)
+        self.get_logger().info("Registered wrist1_height_constraint")
+        self.constraint_functions.append(self.workspace_constraint)
+        self.get_logger().info("Registered workspace_constraint")
         self.constraint_functions.append(self.joint_velocity_constraint)
         self.get_logger().info("Registered joint_velocity_constraint")
         self.constraint_functions.append(self.joint_limit_constraint)
@@ -210,38 +230,35 @@ class UR5eWatchdog(Node):
         self.constraint_functions.append(self.camera_collision_constraint)
         self.get_logger().info("Registered camera_collision_constraint")
         
-    def height_constraint(self, commanded_velocity):
-        max_z = 0.85
-        min_z = 0.2
+    def wrist1_height_constraint(self, commanded_velocity):
+        min_height = self.wrist1_min_height        
+        caution_distance = self.wrist1_caution_distance
         
-        caution_distance = 0.1
+        # Get the current position of the wrist_1_link in the base frame
+        wrist1_position = ur5e_kinematics.wrist1_to_base_transformation(self.joint_states_global["pos"]) @ np.array([0, 0, 0, 1]).T
+        wrist1_height = wrist1_position[2]  # z-coordinate
         
         cartesian_velocity = self.current_jacobian @ commanded_velocity
+        z_velocity = cartesian_velocity[2]
         
-        current_z = self.get_current_coordinate()[2]
-        commanded_z = current_z + cartesian_velocity[2] * (1 / self.control_rate)
+        projected_wrist1_height = wrist1_height + z_velocity * 0.005
         
-        if cartesian_velocity[2] > 0 and commanded_z > max_z - caution_distance:
-            #self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) > max_z - caution_distance ({max_z - caution_distance})")
-            if commanded_z > max_z:
-                #self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) > max_z ({max_z})")
-                cartesian_velocity[2] = 0
-            else:
-                cartesian_velocity[2] = ((max_z - commanded_z) / (caution_distance)) * cartesian_velocity[2]
+        if projected_wrist1_height > min_height + caution_distance:
+            return commanded_velocity  # No constraint needed
         
-        elif cartesian_velocity[2] < 0 and commanded_z < min_z + caution_distance:
-            #self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) < min_z + caution_distance ({min_z + caution_distance})")
-            if commanded_z < min_z:
-                #self.get_logger().info(f"Height constraint activated: commanded_z ({commanded_z}) < min_z ({min_z})")
-                cartesian_velocity[2] = 0
-            else:
-                cartesian_velocity[2] = ((commanded_z - min_z) / (caution_distance)) * cartesian_velocity[2]
-                
-        else:
-            return commanded_velocity
-        
+        if projected_wrist1_height < min_height and z_velocity < 0:
+            self.get_logger().warn(f"Wrist1 height constraint activated: Projected wrist1 height ({projected_wrist1_height:.3f}) below minimum ({min_height}). Stopping downward motion.")
+            cartesian_velocity[2] = 0  # Stop downward motion
+            altered_velocity = self.current_jacobian_inverse @ cartesian_velocity
+            return altered_velocity
+            
+        scale = self.wrist1_caution_scaler.scale(projected_wrist1_height)
+        cartesian_velocity[2] *= scale  # Scale downward motion
         altered_velocity = self.current_jacobian_inverse @ cartesian_velocity
+        self.get_logger().info(f"Wrist1 height constraint activated: Projected wrist1 height ({projected_wrist1_height:.3f}) within caution zone. Scaling downward motion by {scale:.2f}.")
         return altered_velocity
+            
+        
        
     def joint_velocity_constraint(self, commanded_velocity):
         altered_velocity = np.copy(commanded_velocity)
@@ -281,13 +298,55 @@ class UR5eWatchdog(Node):
                     
         return altered_velocity
 
+    def workspace_constraint(self, commanded_velocity):
+        rotated_position = self.rotate_45 @ self.current_position
+                
+        cartesian_velocity = self.current_jacobian @ commanded_velocity
+        v_linear_base = cartesian_velocity[:3]
+        rotated_velocity = self.rotate_45 @ v_linear_base
+        
+        altered = False
+        
+        for i in range(3):
+            pos_i = rotated_position[i]
+            vel_i = rotated_velocity[i]
+            min_b, max_b = self.bounds[i]
+            
+            # Moving towards minimum boundary
+            if vel_i < 0:
+                if pos_i < min_b:
+                    rotated_velocity[i] = 0.0
+                    altered = True
+                elif pos_i < min_b + self.boundary_margin:
+                    scale = (pos_i - min_b) / self.boundary_margin
+                    rotated_velocity[i] *= np.clip(scale, 0.0, 1.0)
+                    altered = True
+                    
+            # Moving towards maximum boundary
+            elif vel_i > 0:
+                if pos_i > max_b:
+                    rotated_velocity[i] = 0.0
+                    altered = True
+                elif pos_i > max_b - self.boundary_margin:
+                    scale = (max_b - pos_i) / self.boundary_margin
+                    rotated_velocity[i] *= np.clip(scale, 0.0, 1.0)
+                    altered = True
+
+        # 5. If altered, rotate back to base frame and solve inverse kinematics
+        if altered:
+            cartesian_velocity[:3] = self.rotate_45.T @ rotated_velocity
+            altered_velocity = self.current_jacobian_inverse @ cartesian_velocity
+            return altered_velocity
+            
+        return commanded_velocity
+
     def singularity_constraint(self, commanded_velocity):
         sigma_values = np.linalg.svd(self.current_jacobian, compute_uv=False)
         sigma_current = sigma_values[-1]
         
         # 1. Define speed limits (rad/s)
         limit_scale_max = 1.0
-        limit_scale_min = 0.1
+        limit_scale_min = 0.05
         
         # 2. Smoothly calculate the speed ceiling based on sigma
         if sigma_current >= self.sigma_caution_threshold:
@@ -307,9 +366,6 @@ class UR5eWatchdog(Node):
             # Moving deeper into critical limit -> absolute stop
             return np.zeros_like(commanded_velocity)
             
-        # If escaping, allow a controlled, safe exit speed (e.g., capped at 0.4 rad/s)
-        if sigma_next > sigma_current and sigma_current < self.sigma_caution_threshold:
-            allowed_limit_scale = max(allowed_limit_scale, 0.25)
         # 4. DIRECTION-PRESERVING SPEED CLAMP:
         # If any joint exceeds allowed_speed, scale the ENTIRE vector down uniformly
         
@@ -414,6 +470,7 @@ class UR5eWatchdog(Node):
         while rclpy.ok():
             self.current_jacobian = self.get_jacobian_matrix()
             self.current_jacobian_inverse = self.get_inverse_jacobian()
+            self.current_position = self.get_current_coordinate()
                       
             self.constrain_and_publish_velocity_command(self.current_velocity_command.copy())
 

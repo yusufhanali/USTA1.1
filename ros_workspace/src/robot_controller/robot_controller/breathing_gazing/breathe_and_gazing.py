@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import rclpy
 from rclpy.signals import SignalHandlerOptions
 
+from experiment.exp_config import BREATHING_PERIOD, BREATHING_AMPLITUDE
 from robot_control.new_controller import NewController
 import robot_controller.breathing.breathing_src as breathing_src
 import utilities.control_and_filters as control_and_filters_utils
@@ -26,11 +27,8 @@ class BreatheAndGazeController(NewController):
         human_data_path = "/home/kovan/USTA1.1/ros_workspace/src/robot_controller/robot_controller/breathing/breathe_data.npy"
         f = np.load(human_data_path)               
         self.breathe_dict["f"] = f
-
-        # FAST: period = 2, amplitude = 1.2
-        # DEFAULT: period = 4, amplitude = 1.0
         
-        self.breathe_period, amplitude = 4, 1.0
+        self.breathe_period, amplitude = BREATHING_PERIOD, BREATHING_AMPLITUDE
         freq = 1.0 / self.breathe_period  # Named as beta in the paper
         self.breathe_dict["freq"] = freq
         self.breathe_dict["amplitude"] = amplitude
@@ -53,6 +51,8 @@ class BreatheAndGazeController(NewController):
         self.prev_dist_to_target = 0
         self.gaze_filter = control_and_filters_utils.LinearFilter(alpha=0.05)
         
+        self.breathe_controller = None
+        
         self.do_breathing = do_breathing
         self.do_gazing = do_gazing
         
@@ -65,15 +65,24 @@ class BreatheAndGazeController(NewController):
         
         self.breath_forwards = []
         self.log_breath_forwards = False
-
+        
+        self.raw_gaze_velocities = []
+        self.filtered_gaze_velocities = []
+        self.log_gaze_velocities = False
+        
+        self.raw_target_positions = []
+        self.filtered_target_positions = []
+        self.log_target_positions = False
+        
+        self.debug_array = []
+        
 
     def set_breathing_gazing(self, go_home=True, go_home_speed=0.3):        
         try:
             self.breathing_task = np.zeros(3)
             self.target_in_base_position = np.zeros(3)
             self.min_dist_to_target = 1.0
-            self.linear_slope = control_and_filters_utils.LinearScaler(1, 1.7, 0.2, 0.5)
-            self.slope_smoother = control_and_filters_utils.LinearFilter(alpha=0.1)
+            self.waist_limit_scaler = control_and_filters_utils.LinearScaler(min_input=0.5, max_input=1.5, min_output=1.0, max_output=0.2)
             self.forward_smoother = control_and_filters_utils.LinearFilter(alpha=0.3)
             self.target_position_smoother = control_and_filters_utils.VectorLinearFilter(alpha=0.2, dimension=3)
             
@@ -134,6 +143,37 @@ class BreatheAndGazeController(NewController):
                 
                 target_to_base = self.world_to_base_homogeneous @ target_to_world_homo
                 
+                #waist
+                base_to_shoulder = ur5e_kinematics.base_to_shoulder_transformation(self.joint_states_global["pos"])
+                target_in_shoulder = base_to_shoulder @ target_to_base
+                target_in_shoulder_pos = np.array([target_in_shoulder[0, 3], target_in_shoulder[1, 3], 0])                
+                target_in_shoulder_norm = np.linalg.norm(target_in_shoulder_pos)
+                var1 = target_in_shoulder_pos[0]/target_in_shoulder_norm
+                if var1 >= -1 and var1 <= 1:
+                    waist = np.arccos(var1)
+                else:
+                    waist = 0
+                waist = waist if target_in_shoulder_pos[1] > 0 else -waist
+                waist = geometry_utils.angular_wrap(waist)
+                
+                if waist + self.joint_states_global["pos"][0] <= ur5e_kinematics.JOINT_LIMITS[0, 0]:
+                    waist = waist + 2*np.pi
+                elif waist + self.joint_states_global["pos"][0] >= ur5e_kinematics.JOINT_LIMITS[0, 1]:
+                    waist = waist - 2*np.pi
+                                
+                waist_limit = self.waist_limit_scaler.scale(abs(waist))
+                self.debug_array.append(waist_limit)
+                                
+                gazing_velocities[0] = waist * self.gaze_multiplier * waist_ratio
+                total_error[0] = waist * waist_ratio
+                if abs(gazing_velocities[0]) > waist_limit:
+                    gazing_velocities[0] = np.sign(gazing_velocities[0]) * waist_limit
+                elif abs(gazing_velocities[0]) < 0.03:
+                    gazing_velocities[0] = 0
+                    total_error[0] = 0
+                
+                #gazing_velocities[0] *= 0.4 # retards waist movement, makes it less aggressive. 
+                
                 #wrist1
                 w1_to_base_rot = ur5e_kinematics.wrist1_to_base_rotation(self.joint_states_global["pos"])
                 delta_in_w1 = w1_to_base_rot.T @ delta_in_base    
@@ -189,34 +229,6 @@ class BreatheAndGazeController(NewController):
                     gazing_velocities[2] = 0
                     total_error[2] = 0
                 #gazing_velocities[2] *= 0.5 # retards wrist2 movement, makes it less aggressive.
-                    
-                #waist
-                base_to_shoulder = ur5e_kinematics.base_to_shoulder_transformation(self.joint_states_global["pos"])
-                target_in_shoulder = base_to_shoulder @ target_to_base
-                target_in_shoulder_pos = np.array([target_in_shoulder[0, 3], target_in_shoulder[1, 3], 0])                
-                target_in_shoulder_norm = np.linalg.norm(target_in_shoulder_pos)
-                var1 = target_in_shoulder_pos[0]/target_in_shoulder_norm
-                if var1 >= -1 and var1 <= 1:
-                    waist = np.arccos(var1)
-                else:
-                    waist = 0
-                waist = waist if target_in_shoulder_pos[1] > 0 else -waist
-                waist = geometry_utils.angular_wrap(waist)
-                
-                if waist + self.joint_states_global["pos"][0] <= ur5e_kinematics.JOINT_LIMITS[0, 0]:
-                    waist = waist + 2*np.pi
-                elif waist + self.joint_states_global["pos"][0] >= ur5e_kinematics.JOINT_LIMITS[0, 1]:
-                    waist = waist - 2*np.pi
-                
-                gazing_velocities[0] = waist * self.gaze_multiplier * waist_ratio
-                total_error[0] = waist * waist_ratio
-                if abs(gazing_velocities[0]) > joint_limits[0]:
-                    gazing_velocities[0] = np.sign(gazing_velocities[0]) * joint_limits[0]
-                elif abs(gazing_velocities[0]) < 0.03:
-                    gazing_velocities[0] = 0
-                    total_error[0] = 0
-                
-                #gazing_velocities[0] *= 0.4 # retards waist movement, makes it less aggressive. 
                 
                 #wrist3 (wrist3 is also eef)
                 base_to_w3 = ur5e_kinematics.get_inverse_ee_transformation(self.joint_states_global["pos"])
@@ -265,7 +277,11 @@ class BreatheAndGazeController(NewController):
                     total_error[3] = 0
                 #gazing_velocities[3] *= 0.5 # retards wrist3 movement, makes it less aggressive.                          
                 
+                if self.log_gaze_velocities:
+                    self.raw_gaze_velocities.append(gazing_velocities.copy())
                 gazing_velocities = self.gaze_filter.filter(gazing_velocities)
+                if self.log_gaze_velocities:
+                    self.filtered_gaze_velocities.append(gazing_velocities.copy())
                 #print("Gaze velocities: ", gazing_velocities, "wrist1: ", wrist1, "wrist2: ", wrist2)
 
             except Exception as e:
@@ -299,11 +315,10 @@ class BreatheAndGazeController(NewController):
 
     def breathe_step(self):
         target_distance = np.linalg.norm(self.target_in_base_position[:2])
-        #breathing_gazing_controller.breathe_controller.set_frequency(slope_smoother.filter(linear_slope.scale(target_distance)) if target_distance != 0 else linear_slope.min_output)
-        #print(f"Target distance: {target_distance:.2f} m, Breathe frequency: {self.breathe_controller.freq:.2f} Hz", end="\r")
         forward = 0.0 if target_distance == 0 or target_distance > self.min_dist_to_target else target_distance-self.min_dist_to_target
         forward = np.clip(forward, -0.7, 0.7)
         forward = self.forward_smoother.filter(forward)
+        print(f"Target distance: {target_distance:.3f}, Forward movement: {forward:.3f}", end="\r")
         if self.log_breath_forwards:
             self.breath_forwards.append(forward)
         breathe_velocities, self.breathing_task, cx, cz = self.get_breathe_velocities(forward_movement = forward) #wedge_forward.scale((time.time() - start_time)%10))
@@ -317,9 +332,17 @@ class BreatheAndGazeController(NewController):
         if gaze_target_name is None:
             gaze_target_name = self.gaze_target_name
         target_in_world = self.tfBuffer.lookup_transform(self.world, gaze_target_name, rclpy.time.Time())
-        target_position = [target_in_world.transform.translation.x, target_in_world.transform.translation.y, target_in_world.transform.translation.z]
-        target_position = self.target_position_smoother.filter(target_position)
-        target_orientation = [target_in_world.transform.rotation.x, target_in_world.transform.rotation.y, target_in_world.transform.rotation.z, target_in_world.transform.rotation.w]
+        target_position_raw = [target_in_world.transform.translation.x,
+                               target_in_world.transform.translation.y,
+                               target_in_world.transform.translation.z]
+        target_position = self.target_position_smoother.filter(target_position_raw)
+        if self.log_target_positions:
+            self.raw_target_positions.append(target_position_raw)
+            self.filtered_target_positions.append(target_position)
+        target_orientation = [target_in_world.transform.rotation.x,
+                              target_in_world.transform.rotation.y,
+                              target_in_world.transform.rotation.z,
+                              target_in_world.transform.rotation.w]
         gaze_velocities, self.target_in_base_position, _ = self.get_gaze_velocities(target_position=target_position,
                                                                                                    target_orientation=target_orientation,
                                                                                                    breathing_task=np.array([self.breathing_task[0], 0.0, self.breathing_task[1]]),
@@ -342,13 +365,7 @@ class BreatheAndGazeController(NewController):
         if self.do_gazing:
             gaze_velocities = self.gaze_step()
         
-        total_velocities = np.array([gaze_velocities[0], breathe_velocities[0], breathe_velocities[1], gaze_velocities[1] , gaze_velocities[2], gaze_velocities[3]])
-        
-        if self.log_joint_velocities:                              
-            self.joint_velocities_sent.append(total_velocities)
-            self.joint_velocities_real.append(self.joint_states_global["vels"])
-        if self.log_end_effector_poses:
-            self.end_effector_poses.append(self.get_current_coordinate())        
+        total_velocities = np.array([gaze_velocities[0], breathe_velocities[0], breathe_velocities[1], gaze_velocities[1] , gaze_velocities[2], gaze_velocities[3]])       
         
         return total_velocities
 
@@ -377,6 +394,45 @@ class BreatheAndGazeController(NewController):
             plt.legend()
             #plt.show(block=False)
 
+        if hasattr(self, 'raw_gaze_velocities') and len(self.raw_gaze_velocities) > 0:
+            for i in range(self.num_of_gazing_joints):
+                plt.figure(self.figure_index)
+                self.figure_index += 1
+                plt.plot([v[i] for v in self.raw_gaze_velocities], label=f"Raw Gaze Velocity for Gaze Joint {i+1}")
+                plt.plot([v[i] for v in self.filtered_gaze_velocities], label=f"Filtered Gaze Velocity for Gaze Joint {i+1}")
+                plt.title(f"Gaze Velocities for Gaze Joint {i+1} Over Time")
+                plt.xlabel("Time Step")
+                plt.ylabel("Velocity (rad/s)")
+                plt.legend()
+                #plt.show(block=False)
+                
+        if hasattr(self, 'raw_target_positions') and len(self.raw_target_positions) > 0:
+            for i in range(3):  # For x, y, z
+                plt.figure(self.figure_index)
+                self.figure_index += 1
+                plt.plot([pos[i] for pos in self.raw_target_positions], label=f"Raw Target Position {['X', 'Y', 'Z'][i]}")
+                plt.plot([pos[i] for pos in self.filtered_target_positions], label=f"Filtered Target Position {['X', 'Y', 'Z'][i]}")
+                plt.title(f"Target Positions for {['X', 'Y', 'Z'][i]} Over Time")
+                plt.xlabel("Time Step")
+                plt.ylabel("Position (m)")
+                plt.legend()
+                #plt.show(block=False)
+
+        if hasattr(self, 'debug_array') and len(self.debug_array) > 0:
+            plt.figure(self.figure_index)
+            self.figure_index += 1
+            plt.plot(self.debug_array, label="Debug Array")
+            plt.title("Debug Array Over Time")
+            plt.xlabel("Time Step")
+            plt.ylabel("Value")
+            plt.legend()
+            #plt.show(block=False)
+        
+
+    def scale_speeds(self, scale=1.0):
+        super().scale_speeds(scale)
+        if self.breathe_controller is not None:
+            self.breathe_controller.scale_frequency(scale)
 
     def start_controller(self, speed=0.3, go_home=True):
         super().start_controller(speed, go_home)

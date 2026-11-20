@@ -43,11 +43,12 @@ class ExperimentController(BreatheAndGazeController):
         super().__init__(name)
         
         self.state = 0
+        self.prev_state = 0
         
         self.camera_towards_board_quat = np.array(la.rotation_matrix_to_quaternion((la.rot_x_homogeneous_matrix(np.pi) @ la.rot_z_homogeneous_matrix(-np.pi/4))[:3, :3]))
         
         self.init_interaction_stuff()
-        
+                
         self.get_logger().info("ExperimentController initialized.")
     
           
@@ -246,6 +247,35 @@ class ExperimentController(BreatheAndGazeController):
     def is_in_bin(self, position_in_world): #TODO: implement a proper check based on the bin's dimensions and position
         return False
       
+    def is_object_holdable(self, object_position, hand_position=None):
+        """
+        Checks if the object is holdable in its current state.
+
+        Args:
+            object_position (np.array): The position of the object in world frame.
+
+        Returns:
+            bool: True if the object is holdable, False otherwise.
+        """
+        object_height = object_position[2]
+        distance_to_base = np.linalg.norm(self.base_position_in_world[:2] - object_position[:2])
+        
+        if object_height < PICK_UP_MIN_HEIGHT or object_height > PICK_UP_MAX_HEIGHT:
+            return False
+        
+        if distance_to_base > MAX_REACHABLE_DISTANCE:
+            return False
+            
+        if self.is_in_bin(object_position):
+            return False
+        
+        if hand_position is not None:
+            distance_to_hand = np.linalg.norm(hand_position - object_position)
+            if distance_to_hand < MIN_DISTANCE_TO_HAND:
+                return False
+        
+        return True
+
     def discover_object(self):
         """
         Searches the TF tree for markers that are within the defined REACHABLE_DISTANCE and PICK_UP_HEIGHT range, 
@@ -261,23 +291,22 @@ class ExperimentController(BreatheAndGazeController):
             marker_frames = [frame for frame in all_frames if frame.startswith(frame_name_prefix)]
             
             for marker_frame in marker_frames:
-                if self.tfBuffer.can_transform("world", marker_frame, rclpy.time.Time()):
-                    marker_pose = self.tfBuffer.lookup_transform("world", marker_frame, rclpy.time.Time())
+                if self.tfBuffer.can_transform(self.world, marker_frame, rclpy.time.Time()):
+                    marker_pose = self.tfBuffer.lookup_transform(self.world, marker_frame, rclpy.time.Time())
                     marker_position = np.array([marker_pose.transform.translation.x,
                                                 marker_pose.transform.translation.y,
                                                 marker_pose.transform.translation.z])
                     
                     marker_position = self.correct_optitrack_position(marker_position)
                     
-                    marker_height = marker_position[2]
-                    distance_to_base = np.linalg.norm(self.base_position_in_world[:2] - marker_position[:2])
-                    self.get_logger().info(f"Checking marker: {marker_frame}, Position: {marker_position}, Height: {marker_height:.2f}, Distance to Base: {distance_to_base:.2f}")
-                    if PICK_UP_MIN_HEIGHT <= marker_height <= PICK_UP_MAX_HEIGHT and distance_to_base <= MAX_REACHABLE_DISTANCE and not self.is_in_bin(marker_position):
+                    hand_position = None
+                    if self.tfBuffer.can_transform(self.world, self.hand_frame, rclpy.time.Time()):
+                        hand_position = self.get_hand_position_in_world()
+                    
+                    if self.is_object_holdable(marker_position, hand_position):
                         self.get_logger().info(f"Found object to pick up: {marker_frame} at position {marker_position}")
-                        self.publish_ball(marker_position, frame="world", marker_id=99, color=(1.0, 0.0, 0.0, 1.0))
+                        self.publish_ball(marker_position, frame=self.world, marker_id=99, color=(1.0, 0.0, 0.0, 1.0))
                         return marker_position
-                    else:
-                        self.get_logger().info(f"Marker {marker_frame} is not suitable for pickup. Height: {marker_height:.2f}, Distance to Base: {distance_to_base:.2f}")
                         
         except Exception as e:
             self.get_logger().error(f"Error while fetching frames: {e}")
@@ -423,7 +452,7 @@ class ExperimentController(BreatheAndGazeController):
         
         return hold_csc    
     
-    def place_object(self, recepticle_position=np.array([-0.3, 0.3, 0.2]), speed=None):
+    def place_object(self, recepticle_position=np.array([0.04, -0.7, 0.2]), speed=None):
         if speed is None:
             speed = self.speed
         
@@ -437,6 +466,22 @@ class ExperimentController(BreatheAndGazeController):
                                                   speed=speed)
         self.open_gripper()
         self.get_logger().info("Placed the object.")
+
+    def create_place_csc(self, recepticle_position=np.array([0.04, -0.7, 0.2]), speed=None):
+        if speed is None:
+            speed = self.speed
+        
+        _, dropoff_orientation = self.create_downwards_frame(recepticle_position)        
+        dropoff_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(dropoff_orientation).as_matrix()).as_quat()
+        
+        place_csc = self.create_cubic_spline_controller(start_point=self.get_current_coordinate(),
+                                                        end_point=recepticle_position,
+                                                        start_derivative=[0.0, 0.0, 0.2],
+                                                        end_derivative=[0.0, 0.0, -0.2],
+                                                        desired_orientation=dropoff_orientation,
+                                                        speed=speed)
+        
+        return place_csc
 
     def hand_object_over_to_table(self, handover_position=None, handover_orientation=None, speed=None):
         if speed is None:
@@ -644,22 +689,42 @@ class apf_generator:
                 
 def observer(experiment_controller: ExperimentController = None, frequency: int = 30):    
     human_apf_generator = apf_generator(apf_source_name = "rigid_body_1", apf_constant = 0.005, threshold_distance = 0.40, max_force = 1.5)
-
-    while rclpy.ok():
-        loop_start_time = time.time()
-        
+    def apply_joint_apf_velocity_command():
         apf_force = human_apf_generator.get_apf_force_from_controller(experiment_controller) 
-        
+                
         apf_velocity_command = np.concatenate((apf_force, np.zeros(3)))  # Assuming no rotational component
         apf_joint_velocity_command = experiment_controller.get_inverse_jacobian() @ apf_velocity_command
             
         experiment_controller.joint_velocity_additive_modifier = apf_joint_velocity_command
 
+    human_distance_speed_scaler = cf.LinearScaler(min_input=1.2, max_input=2.4, min_output=0.5, max_output=1.0)
+    speed_scale_smoother = cf.LinearFilter(alpha=0.5)
+    def speed_setter():
+        human_position_in_base = experiment_controller.tfBuffer.lookup_transform(experiment_controller.base, experiment_controller.gaze_target_name, rclpy.time.Time())
+        human_position_in_base = np.array([human_position_in_base.transform.translation.x,
+                                           human_position_in_base.transform.translation.y])
+        distance_to_human = np.linalg.norm(human_position_in_base)
+        
+        speed_scale = human_distance_speed_scaler.scale(distance_to_human)
+        speed_scale = speed_scale_smoother.filter(speed_scale)
+        experiment_controller.scale_speeds(speed_scale)   
+    
+    is_adaptive = SESSION_TYPE == "adaptive"
+    is_hand_avoidant = False
+      
+    while rclpy.ok():
+        loop_start_time = time.time()
+        
+        if is_hand_avoidant:
+            apply_joint_apf_velocity_command()
+        
+        if is_adaptive:
+            speed_setter()
+
         elapsed_time = time.time() - loop_start_time
         #print(f"Maximum allowed time: {1.0 / frequency * 1000:.2f} ms, Elapsed time in ms: {elapsed_time * 1000:.2f}", end="\r")
         sleep_time = max(0, (1.0 / frequency) - elapsed_time)
         time.sleep(sleep_time)
-
 
 class machine_csc_executor():
     def __init__(self, 
@@ -667,8 +732,7 @@ class machine_csc_executor():
                  ec: ExperimentController = None,
                  csc: CubicSplineController = None, 
                  max_error: float = 0.001, 
-                 next_state: int = 5, 
-                 exit_function: callable = None):
+                 next_state: int = 5):
         
         if ec is None or csc is None:
             raise ValueError("ExperimentController and CubicSplineController instances must be provided.")
@@ -680,11 +744,15 @@ class machine_csc_executor():
         self.current_error = np.linalg.norm(self.csc.end_point - self.ec.get_current_coordinate())
         self.max_error = max_error
         
-        self.next_state = next_state        
-        self.exit_function = exit_function
+        self.next_state = next_state
+        
+        self.exited = False 
         
     def step(self):
-        velocity_command = self.csc.get_cubic_velocities()
+        velocity_command = self.csc.get_cubic_velocities(speed_multiplier=self.ec.speed_scale)
+        
+        if self.ec.log_eef_velocities:
+            self.ec.eef_velocities_sent.append(velocity_command)
                                 
         pinv_jacobian = self.ec.get_inverse_jacobian()
         joint_velocities = pinv_jacobian @ velocity_command
@@ -696,11 +764,110 @@ class machine_csc_executor():
             
             self.ec.state = self.next_state
             self.ec.get_logger().info(f"{self.name} execution completed.")
-            
-            if self.exit_function:
-                self.exit_function()
+
+            self.exited = True
                 
         return joint_velocities
+
+
+def demo_machine(ec: ExperimentController = None):  
+    state_0 = "breathing_gazing"
+    state_1 = "holding"
+    holding_csc_executor = None
+    state_2 = "placing"
+    placing_csc_executor = None
+    state_3 = "handover_give"
+    handover_give_csc_executor = None
+    state_4 = "handover_take"
+    handover_take_csc_executor = None
+    
+    max_error = 0.001
+    
+    current_error = 0.0
+    
+    ec.open_gripper()
+    
+    ec.state = 0
+    ec.prev_state = 0 #-1
+    tick_counter = 0 #TODO: maybe there is a better way for this 
+    
+    breathe_duration = 30.0
+    breathe_start_time = time.time()
+    while rclpy.ok():
+        joint_velocities = np.zeros(6)
+        
+        if ec.state == 0:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                ec.set_breathing_gazing()
+            
+            if time.time() - breathe_start_time > breathe_duration:
+                ec.state = 5
+            joint_velocities = ec.breathe_and_gaze_step()
+        
+        elif ec.state == 1:
+            if holding_csc_executor == None:
+                holding_csc_executor = machine_csc_executor(name="holding_csc_executor",
+                                                            ec=ec,
+                                                            csc=ec.discover_and_create_hold_csc(),
+                                                            max_error=max_error,
+                                                            next_state=2)
+            
+            joint_velocities = holding_csc_executor.step()
+            
+            if holding_csc_executor.exited:
+                ec.close_gripper()
+                holding_csc_executor = None
+        
+        elif ec.state == 2:
+            if placing_csc_executor == None:
+                placing_csc_executor = machine_csc_executor(name="placing_csc_executor",
+                                                            ec=ec,
+                                                            csc=ec.create_place_csc(),
+                                                            max_error=max_error,
+                                                            next_state=1)
+            
+            joint_velocities = placing_csc_executor.step()
+            
+            if placing_csc_executor.exited:
+                ec.open_gripper()
+                placing_csc_executor = None
+        
+        elif ec.state == 3:
+            if handover_give_csc_executor == None:
+                tick_counter = 0
+                handover_give_csc_executor = machine_csc_executor(name="handover_give_csc_executor",
+                                                                  ec=ec,
+                                                                  csc=ec.create_handover_to_hand_csc(),
+                                                                  max_error=max_error,
+                                                                  next_state=0)
+            
+            if tick_counter % (ec.control_rate//5) == 0:
+                tick_counter = 0
+            
+                if handover_give_csc_executor.current_error > 0.02:
+                    hand_in_base_position, handover_orientation = ec.calculate_outward_handover_pose()
+                    handover_give_csc_executor.csc.set_end_point(hand_in_base_position)
+                    handover_give_csc_executor.csc.set_desired_orientation(handover_orientation)
+            
+            joint_velocities = handover_give_csc_executor.step()
+            
+            tick_counter += 1
+        
+            if handover_give_csc_executor.exited:
+                ec.open_gripper(wait_time=0.5)
+                handover_give_csc_executor = None
+                breathe_start_time = time.time()
+        
+        elif ec.state == 4:
+            pass
+        
+        elif ec.state == 5:
+            ec.stop_movement()
+            return
+        
+        ec.publish_velocity_command(joint_velocities)
+        ec.ros_rate.sleep() 
 
 def machine(ec: ExperimentController = None):  
     state_0 = "breathing_gazing"
@@ -782,14 +949,14 @@ def main(args=None):
         controller_spin_thread = threading.Thread(target=spin_thread, args=(experiment_controller,))
         controller_spin_thread.start()
         
-        #observer_thread = threading.Thread(target=observer, args=(experiment_controller, ))
-        #observer_thread.start()
+        observer_thread = threading.Thread(target=observer, args=(experiment_controller, ))
+        observer_thread.start()
         
         print("Starting main.")
                    
-        experiment_controller.start_controller(speed=0.6, go_home=True)
+        experiment_controller.start_controller(speed=CONTROLLER_SPEED, go_home=True)
                          
-        machine(experiment_controller)
+        demo_machine(experiment_controller)
         
         experiment_controller.stop_movement()
     except KeyboardInterrupt:
@@ -803,6 +970,6 @@ def main(args=None):
 
     rclpy.try_shutdown()
     controller_spin_thread.join()
-    #observer_thread.join()
+    observer_thread.join()
     
     os.system("cowsay ' take care of yourself '")
