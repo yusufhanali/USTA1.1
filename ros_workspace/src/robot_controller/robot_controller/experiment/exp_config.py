@@ -1,5 +1,6 @@
 import numpy as np
 
+# --------------- PICK, PLACE AND INTERACTION CONFIGURATION ---------------
 PICK_UP_MAX_HEIGHT = 0.85
 PICK_UP_MIN_HEIGHT = 0.75
 
@@ -11,8 +12,18 @@ HANDOVER_SAFEBOX = np.array([np.array([1.03, -0.49]), np.array([1.44, -0.49]), n
 
 PICK_UP_AREA = np.array([np.array([1.03, -0.49]), np.array([1.44, -0.49]), np.array([1.44, -0.04]), np.array([1.03, -0.04])])
 PLACEMENT_AREA = np.array([np.array([1.35, 0.52]), np.array([1.23, 0.52]), np.array([1.10, 0.52]), np.array([1.35, 0.37]), np.array([1.23, 0.37]), np.array([1.10, 0.37])])
+# --------------- PICK, PLACE AND INTERACTION CONFIGURATION ---------------
 
-SESSION_TYPE = "adaptive"  # Options: "adaptive", "fast", "slow"
+
+# --------------- EXPERIMENT SIGNAL CONFIGURATION ---------------
+EXPERIMENT_SIGNALS_TOPIC = "/experiment_signals"
+START_VIDEO_RECORDING_SIGNAL = "start_video_recording"
+STOP_VIDEO_RECORDING_SIGNAL = "stop_video_recording"
+# --------------- EXPERIMENT SIGNAL CONFIGURATION ---------------
+
+
+# --------------- EXPERIMENT SESSION CONFIGURATION ---------------
+SESSION_TYPE = "slow"  # Options: "adaptive", "fast", "slow"
 
 BREATHING_PERIOD_FAST = 2.0
 BREATHING_AMPLITUDE_FAST = 1.5
@@ -44,3 +55,4 @@ elif SESSION_TYPE == "slow":
     BREATHING_PERIOD = BREATHING_PERIOD_SLOW
     BREATHING_AMPLITUDE = BREATHING_AMPLITUDE_SLOW
     CONTROLLER_SPEED = CONTROLLER_SPEED_SLOW
+# --------------- EXPERIMENT SESSION CONFIGURATION ---------------

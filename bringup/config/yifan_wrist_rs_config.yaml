@@ -9,19 +9,19 @@
 
     device_type: "d435i"
 
-    rgb_camera.profile: "640x480x30"
+    rgb_camera.profile: "1280x720x30"
     depth_module.profile: "640x480x30"
 
     enable_accel: false
     enable_color: true
-    enable_depth: true
+    enable_depth: false
     enable_gyro: false
     enable_infra1: false
     enable_infra2: false
     enable_rgbd: false
-    enable_sync: true
+    enable_sync: false
     
-    pointcloud.enable: true
+    pointcloud.enable: false
     pointcloud.stream_filter: 2 # 2 = COLOR stream
 
     serial_no: "242622071251"

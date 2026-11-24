@@ -35,7 +35,10 @@ class BreatheAndGazeController(NewController):
                 
         self.num_of_breathing_joints = 2  # Breathing with joint 1 and 2 (shoulder and elbow)
 
-        self.breathe_controller = breathing_src.Breather(self.breathe_dict, self.joint_states_global["pos"])
+        if self.breathe_controller is None:
+            self.breathe_controller = breathing_src.Breather(self.breathe_dict, self.joint_states_global["pos"])
+        else:
+            self.breathe_controller.reset()
 
     def __init__(self, name = "breathe_and_gazing_controller", do_breathing = True, do_gazing = True):
         super().__init__(name)
@@ -82,7 +85,7 @@ class BreatheAndGazeController(NewController):
             self.breathing_task = np.zeros(3)
             self.target_in_base_position = np.zeros(3)
             self.min_dist_to_target = 1.0
-            self.waist_limit_scaler = control_and_filters_utils.LinearScaler(min_input=0.5, max_input=1.5, min_output=1.0, max_output=0.2)
+            self.waist_limit_scaler = control_and_filters_utils.LinearScaler(min_input=0.5, max_input=1.5, min_output=1.0, max_output=0.1)
             self.forward_smoother = control_and_filters_utils.LinearFilter(alpha=0.3)
             self.target_position_smoother = control_and_filters_utils.VectorLinearFilter(alpha=0.2, dimension=3)
             
@@ -162,7 +165,6 @@ class BreatheAndGazeController(NewController):
                     waist = waist - 2*np.pi
                                 
                 waist_limit = self.waist_limit_scaler.scale(abs(waist))
-                self.debug_array.append(waist_limit)
                                 
                 gazing_velocities[0] = waist * self.gaze_multiplier * waist_ratio
                 total_error[0] = waist * waist_ratio
@@ -190,12 +192,12 @@ class BreatheAndGazeController(NewController):
                     wrist1 = np.arccos(var1) - np.arccos(var2)
                 else:
                     wrist1 = 0
-                wrist1 = -wrist1 if target_in_w1_pos[0] > 0 else wrist1
+                #wrist1 = -wrist1 if target_in_w1_pos[0] > 0 else wrist1 #TODO: why did I write this in the first place
                 wrist1 = geometry_utils.angular_wrap(wrist1)
                 
-                if wrist1 + self.joint_states_global["pos"][1] <= ur5e_kinematics.JOINT_LIMITS[3, 0]:
+                if wrist1 + self.joint_states_global["pos"][3] <= ur5e_kinematics.JOINT_LIMITS[3, 0]:
                     wrist1 = wrist1 + 2*np.pi
-                elif wrist1 + self.joint_states_global["pos"][1] >= ur5e_kinematics.JOINT_LIMITS[3, 1]:
+                elif wrist1 + self.joint_states_global["pos"][3] >= ur5e_kinematics.JOINT_LIMITS[3, 1]:
                     wrist1 = wrist1 - 2*np.pi
                                                             
                 gazing_velocities[1] = wrist1 * self.gaze_multiplier
@@ -318,7 +320,6 @@ class BreatheAndGazeController(NewController):
         forward = 0.0 if target_distance == 0 or target_distance > self.min_dist_to_target else target_distance-self.min_dist_to_target
         forward = np.clip(forward, -0.7, 0.7)
         forward = self.forward_smoother.filter(forward)
-        print(f"Target distance: {target_distance:.3f}, Forward movement: {forward:.3f}", end="\r")
         if self.log_breath_forwards:
             self.breath_forwards.append(forward)
         breathe_velocities, self.breathing_task, cx, cz = self.get_breathe_velocities(forward_movement = forward) #wedge_forward.scale((time.time() - start_time)%10))

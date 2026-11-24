@@ -12,7 +12,7 @@ from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 
 from geometry_msgs.msg import PointStamped
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
 
 from .exp_config import *
 from robot_control.new_controller import spin_thread, CubicSplineController
@@ -38,6 +38,9 @@ class ExperimentController(BreatheAndGazeController):
             time.sleep(1.0)
         
         self.hand_position_smoother.set_value(self.get_hand_position_in_world()/self.hand_position_smoother.alpha)
+        
+        self.handover_take_maf = cf.MovingAverageFilter(window_size=self.control_rate * 1)
+        self.object_taken_from_hand = False
     
     def __init__(self, name = "experiment_controller"):
         super().__init__(name)
@@ -47,11 +50,28 @@ class ExperimentController(BreatheAndGazeController):
         
         self.camera_towards_board_quat = np.array(la.rotation_matrix_to_quaternion((la.rot_x_homogeneous_matrix(np.pi) @ la.rot_z_homogeneous_matrix(-np.pi/4))[:3, :3]))
         
+        self.experiment_signals_topic = EXPERIMENT_SIGNALS_TOPIC
+        self.experiment_signals_publisher = self.create_publisher(String, self.experiment_signals_topic, 10)        
+        
         self.init_interaction_stuff()
+        
+        self.base_avoidance_scaler = cf.LinearScaler(min_input=0.2, max_input=0.4, min_output=3.0, max_output=1)
                 
         self.get_logger().info("ExperimentController initialized.")
     
-          
+    def init_log_buffers(self):        
+        super().init_log_buffers()
+        
+        self.handover_take_buffer = []
+    
+#signaling
+    def send_experiment_signal(self, signal):
+        msg = String()
+        msg.data = signal
+        self.experiment_signals_publisher.publish(msg)
+        self.get_logger().info(f"Sent experiment signal: {signal}")
+    
+#pose and related helpers
     def create_gaze_frame(self, position_in_base):
         """
         Creates a frame at the given position which has a X axis pointing directly towards the robot base, and a Z axis pointing in
@@ -162,7 +182,114 @@ class ExperimentController(BreatheAndGazeController):
     
         return position_in_base, frame_orientation_in_base
     
+    def get_hand_position_in_world(self):
+        hand_transform = self.tfBuffer.lookup_transform(self.world, self.hand_frame, rclpy.time.Time())
+        hand_position_in_world = np.array([hand_transform.transform.translation.x,
+                                           hand_transform.transform.translation.y,
+                                           hand_transform.transform.translation.z])
+        #hand_position_in_world += np.array([0.0, 0.025, 0.0])  # Empirical correction for Optitrack discrepancies 
+        hand_position_in_world = self.correct_optitrack_position(hand_position_in_world)
+        #hand_position_in_world = self.hand_position_smoother.filter(hand_position_in_world)
+        return hand_position_in_world
+
+    def get_hand_position_in_base(self):
+        hand_position_in_world = self.get_hand_position_in_world()
+        hand_position_in_world_homogeneous = np.array([hand_position_in_world[0], hand_position_in_world[1], hand_position_in_world[2], 1.0]).T
+        hand_position_in_base = (self.world_to_base_homogeneous @ hand_position_in_world_homogeneous)[:3]
+        return hand_position_in_base
+            
+    def get_placement_position(self):
+        return np.array([0.0, 0.5, 0.1])  # Example placement position in base frame
+
+    def calculate_downward_handover_pose(self):
+        hand_in_base_position = self.get_hand_position_in_base()
+        hand_in_base_position[2] += 0.07  # Raise the hand position slightly to avoid collision
+        hand_in_world_position, handover_orientation_in_world = self.create_downwards_frame(hand_in_base_position)
+        hand_in_base_position = (self.world_to_base_homogeneous @ np.array([hand_in_world_position[0], hand_in_world_position[1], hand_in_world_position[2], 1.0]).T)[:3]
+        handover_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(handover_orientation_in_world).as_matrix()).as_quat()
+        
+        return hand_in_base_position, handover_orientation
     
+    def calculate_outward_handover_pose(self):
+        hand_in_base_position = self.get_hand_position_in_base()
+        hand_in_base_position[2] += 0.025  # Raise the hand position slightly to avoid collision
+        hand_in_base_position, handover_orientation_in_base = self.create_outwards_frame(hand_in_base_position)
+        
+        return hand_in_base_position, handover_orientation_in_base
+
+    def get_tangential_direction(self, start_point=None, end_point=None):
+        """
+        Calculates the direction tangential to a circle centered at the base.
+
+        Args:
+            start_point (np.array): The starting point of the path in base frame, defaults to eef position.
+            end_point (np.array): The ending point of the path in base frame.
+        Returns:
+            np.array: The tangential direction vector.
+        """
+        if start_point is None:
+            start_point = self.get_current_coordinate()
+        if end_point is None:
+            raise ValueError("End point must be provided to calculate tangential direction.")
+        
+        start_point_projected_normalized = start_point * np.array([1.0, 1.0, 0.0])
+        start_point_projected_normalized /= np.linalg.norm(start_point_projected_normalized)
+        end_point_projected_normalized = end_point * np.array([1.0, 1.0, 0.0])
+        end_point_projected_normalized /= np.linalg.norm(end_point_projected_normalized)
+        left_vector = np.cross(start_point_projected_normalized, np.array([0.0, 0.0, -1.0]))
+        left_vector /= np.linalg.norm(left_vector)
+        is_end_to_the_left = np.sign(np.cross(start_point_projected_normalized, end_point_projected_normalized)[2])
+        how_close_is_the_path_to_the_base = self.how_close_is_the_path_to_the_base(start_point, end_point)
+        left_vector *= is_end_to_the_left 
+        left_vector *= self.base_avoidance_scaler.scale(how_close_is_the_path_to_the_base)
+        
+        return left_vector
+
+    def how_close_is_the_path_to_the_base(self, start_point, end_point, base_position=np.array([0.0, 0.0])):
+        """
+        Checks how close the 2D straight line path from start_point to end_point comes to the robot base.
+
+        Args:
+            start_point (np.array): The starting point of the path in base frame.
+            end_point (np.array): The ending point of the path in base frame.
+            base_position (np.array): The position of the robot base in the same frame.
+        Returns:
+            float: The minimum distance from the path to the robot base.
+        """
+        
+        start_point_2d = start_point[:2]
+        end_point_2d = end_point[:2]
+        
+        x1, y1 = start_point_2d
+        x2, y2 = end_point_2d
+        x0, y0 = base_position
+        
+        distance = abs((y2-y1)* x0 - (x2-x1)* y0 + x2*y1 - y2*x1) / np.sqrt((y2-y1)**2 + (x2-x1)**2)
+        return distance     
+    
+    def correct_optitrack_position(self, object_position):
+        """
+        For some reason, the Optitrack system reports positions that are slightly off from the actual positions.
+        This function attempts to correct the reported position based on observed discrepancies.
+        The 'corrections' here are empirically determined and may need to be adjusted based on further observations.
+        
+        Args:
+            object_position (np.array): The position reported by the Optitrack system.
+        Returns:
+            np.array: The corrected position.        
+        """
+        
+        corrected_poisiton = object_position + np.array([0.0035, 0.025, 0.016])
+
+        y_position = corrected_poisiton[1]
+
+        corrected_poisiton[0] += ((y_position - (-0.61)) / (1.45)) * 0.001
+        corrected_poisiton[2] += ((y_position - (-0.15)) / (1.00)) * -0.015
+        corrected_poisiton[1] += ((y_position - (0.15)) / (-0.84)) * -0.010
+
+        return corrected_poisiton
+    
+#gaze functions
     def look_at_point_in_base(self, point_in_base):
         gaze_velocities = np.ones(4)
             
@@ -224,58 +351,7 @@ class ExperimentController(BreatheAndGazeController):
 
         return gaze_velocities
 
-
-    def get_hand_position_in_world(self):
-        hand_transform = self.tfBuffer.lookup_transform(self.world, self.hand_frame, rclpy.time.Time())
-        hand_position_in_world = np.array([hand_transform.transform.translation.x,
-                                           hand_transform.transform.translation.y,
-                                           hand_transform.transform.translation.z])
-        #hand_position_in_world += np.array([0.0, 0.025, 0.0])  # Empirical correction for Optitrack discrepancies 
-        hand_position_in_world = self.correct_optitrack_position(hand_position_in_world)
-        #hand_position_in_world = self.hand_position_smoother.filter(hand_position_in_world)
-        return hand_position_in_world
-
-    def get_hand_position_in_base(self):
-        hand_position_in_world = self.get_hand_position_in_world()
-        hand_position_in_world_homogeneous = np.array([hand_position_in_world[0], hand_position_in_world[1], hand_position_in_world[2], 1.0]).T
-        hand_position_in_base = (self.world_to_base_homogeneous @ hand_position_in_world_homogeneous)[:3]
-        return hand_position_in_base
-            
-    def get_placement_position(self):
-        return np.array([0.0, 0.5, 0.1])  # Example placement position in base frame
-      
-    def is_in_bin(self, position_in_world): #TODO: implement a proper check based on the bin's dimensions and position
-        return False
-      
-    def is_object_holdable(self, object_position, hand_position=None):
-        """
-        Checks if the object is holdable in its current state.
-
-        Args:
-            object_position (np.array): The position of the object in world frame.
-
-        Returns:
-            bool: True if the object is holdable, False otherwise.
-        """
-        object_height = object_position[2]
-        distance_to_base = np.linalg.norm(self.base_position_in_world[:2] - object_position[:2])
-        
-        if object_height < PICK_UP_MIN_HEIGHT or object_height > PICK_UP_MAX_HEIGHT:
-            return False
-        
-        if distance_to_base > MAX_REACHABLE_DISTANCE:
-            return False
-            
-        if self.is_in_bin(object_position):
-            return False
-        
-        if hand_position is not None:
-            distance_to_hand = np.linalg.norm(hand_position - object_position)
-            if distance_to_hand < MIN_DISTANCE_TO_HAND:
-                return False
-        
-        return True
-
+#object helpers
     def discover_object(self):
         """
         Searches the TF tree for markers that are within the defined REACHABLE_DISTANCE and PICK_UP_HEIGHT range, 
@@ -314,30 +390,174 @@ class ExperimentController(BreatheAndGazeController):
         
         self.get_logger().warn("No suitable object found to pick up.")
         return None
-
-    def correct_optitrack_position(self, object_position):
+      
+    def is_in_bin(self, position_in_world): #TODO: implement a proper check based on the bin's dimensions and position
+        return False
+      
+    def is_object_holdable(self, object_position, hand_position=None):
         """
-        For some reason, the Optitrack system reports positions that are slightly off from the actual positions.
-        This function attempts to correct the reported position based on observed discrepancies.
-        The 'corrections' here are empirically determined and may need to be adjusted based on further observations.
-        
+        Checks if the object is holdable in its current state.
+
         Args:
-            object_position (np.array): The position reported by the Optitrack system.
+            object_position (np.array): The position of the object in world frame.
+
         Returns:
-            np.array: The corrected position.        
+            bool: True if the object is holdable, False otherwise.
         """
+        object_height = object_position[2]
+        distance_to_base = np.linalg.norm(self.base_position_in_world[:2] - object_position[:2])
         
-        corrected_poisiton = object_position + np.array([0.0035, 0.025, 0.016])
+        if object_height < PICK_UP_MIN_HEIGHT or object_height > PICK_UP_MAX_HEIGHT:
+            return False
+        
+        if distance_to_base > MAX_REACHABLE_DISTANCE:
+            return False
+            
+        if self.is_in_bin(object_position):
+            return False
+        
+        if hand_position is not None:
+            distance_to_hand = np.linalg.norm(hand_position - object_position)
+            if distance_to_hand < MIN_DISTANCE_TO_HAND:
+                return False
+        
+        return True
 
-        y_position = corrected_poisiton[1]
+#movement and trajectory planners
+    def create_hold_csc(self, object_pose=None, speed=None, minimize_wrist_rotation=True):
+        """
+        Return cubic spline controller that guides the robot to hold an object in the given pose at the given speed.
 
-        corrected_poisiton[0] += ((y_position - (-0.61)) / (1.45)) * 0.001
-        corrected_poisiton[2] += ((y_position - (-0.15)) / (1.00)) * -0.015
-        corrected_poisiton[1] += ((y_position - (0.15)) / (-0.84)) * -0.010
+        Args:
+            object_pose (np.array, optional): The position and orientation in the base frame. Defaults to None.
+            speed (Float, optional): The speed at which the end effector would be moving. Defaults to None.
+        """
+        if speed is None:
+            speed = self.speed
+        
+        self.open_gripper_async()
+        
+        if object_pose is None:
+            object_pose = self.discover_object()
+            
+        if len(object_pose) == 7:
+            object_position = object_pose[:3]
+            object_orientation = object_pose[3:]
+        elif len(object_pose) == 3:
+            object_position = object_pose
+            object_orientation = self.camera_towards_board_quat
+        elif len(object_pose) == 16:
+            object_position = object_pose[:3, 3]
+            object_orientation_matrix = object_pose[:3, :3]
+            object_orientation = R.from_matrix(object_orientation_matrix).as_quat()
+        else:
+            self.get_logger().error(f"Invalid object_pose length: {len(object_pose)}. Expected either:\n3 (xyz),\n7 (xyz + xyzw),\n16 (4x4 homogeneous matrix).")
+            return
+        
+        if minimize_wrist_rotation:
+            #rotate around z by 180 degrees if necessary to prevent unnecessary wrist rotation
+            current_orientation_matrix = self.get_current_orientation()
+            object_orientation_matrix = R.from_quat(object_orientation).as_matrix()
+            object_orientation_matrix_rotated =  object_orientation_matrix @ R.from_euler('z', np.pi).as_matrix()
+            
+            current_to_object_orientation = R.from_matrix(current_orientation_matrix.T @ object_orientation_matrix).as_rotvec()
+            current_to_object_orientation_rotated = R.from_matrix(current_orientation_matrix.T @ object_orientation_matrix_rotated).as_rotvec()
+            current_to_object_orientation_norm = np.linalg.norm(current_to_object_orientation)
+            current_to_object_orientation_rotated_norm = np.linalg.norm(current_to_object_orientation_rotated)
+            
+            if current_to_object_orientation_rotated_norm < current_to_object_orientation_norm:
+                object_orientation = R.from_matrix(object_orientation_matrix_rotated).as_quat()
+        
+        current_position = self.get_current_coordinate()
+        tangential_direction = self.get_tangential_direction(start_point=current_position, end_point=object_position)
+        
+        hold_csc = self.create_cubic_spline_controller(start_point=current_position,
+                                                        end_point=object_position,
+                                                        start_derivative=tangential_direction,  # Example start derivative
+                                                        end_derivative=[0.0, 0.0, -0.4],  # Example end derivative
+                                                        desired_orientation=object_orientation,
+                                                        speed=speed)
+        
+        return hold_csc    
 
-        return corrected_poisiton
+    def create_place_csc(self, recepticle_position=np.array([0.04, -0.7, 0.2]), speed=None):
+        if speed is None:
+            speed = self.speed
+        
+        _, dropoff_orientation = self.create_downwards_frame(recepticle_position)        
+        dropoff_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(dropoff_orientation).as_matrix()).as_quat()
+        
+        current_position = self.get_current_coordinate()
+        tangential_direction = self.get_tangential_direction(start_point=current_position, end_point=recepticle_position)
+        if self.get_current_coordinate()[2] < 0.15:
+            tangential_direction[2] = 2.0
+        else:
+            tangential_direction[2] = 0.0
+        
+        place_csc = self.create_cubic_spline_controller(start_point=self.get_current_coordinate(),
+                                                        end_point=recepticle_position,
+                                                        start_derivative=tangential_direction,
+                                                        end_derivative=[0.0, 0.0, -0.1],
+                                                        desired_orientation=dropoff_orientation,
+                                                        speed=speed)
+        
+        return place_csc
 
+    def create_handover_to_hand_csc(self, speed=None):
+        if speed is None:
+            speed = self.speed
+        
+        hand_in_base_position, handover_orientation = self.calculate_outward_handover_pose()
+        
+        current_position = self.get_current_coordinate()
+        tangential_direction = self.get_tangential_direction(start_point=current_position, end_point=hand_in_base_position)        
+        if self.get_current_coordinate()[2] < 0.15:
+            tangential_direction[2] = 0.5
+        else:
+            tangential_direction[2] = 0.0
+        
+        cubic_spline_controller = self.create_cubic_spline_controller(start_point=current_position,
+                                                                      end_point=hand_in_base_position,
+                                                                      start_derivative= tangential_direction,#movement_direction * 0.3,  # Example start derivative
+                                                                      end_derivative=[0.0, 0.0, -0.2],  # Example end derivative
+                                                                      desired_orientation=handover_orientation,
+                                                                      speed=speed)
+        return cubic_spline_controller
 
+    def discover_and_create_hold_csc(self, speed=None):
+            """
+            Discover an object and return the cubic spline controller for holding it.
+    
+            Args:
+                speed (float, optional): The speed at which the robot will move. Defaults to controller speed.
+            """
+            if speed is None:
+                speed = self.speed
+                
+            object_position = self.discover_object()
+            if object_position is None:
+                self.get_logger().warn("Can't find and pick up object because no suitable object was found.")
+                return None
+            
+            object_position_in_base = (self.world_to_base_homogeneous @ np.array([object_position[0], object_position[1], object_position[2], 1.0]).T)[:3]
+            object_position_in_base[2] -= 0.04
+            pickup_orientation = self.create_downwards_frame(object_position_in_base)[1]
+            pickup_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(pickup_orientation).as_matrix()).as_quat()
+            pickup_pose = np.concatenate((object_position_in_base, pickup_orientation))
+            
+            hold_csc = self.create_hold_csc(object_pose=pickup_pose, speed=speed, minimize_wrist_rotation=False)
+
+            return hold_csc
+
+    def take_object_from_hand(self):
+        effort_val = self.handover_take_maf.filter(self.joint_states_global["effs"][3])
+        
+        if effort_val < 0.1 and len(self.handover_take_maf.values) == self.handover_take_maf.window_size:
+            self.close_gripper()
+            self.object_taken_from_hand = True
+        
+
+#deprecated BULLSHIT
     def hold_object(self, object_pose=None, speed=None, minimize_wrist_rotation=True):
         """
         Hold an object in the given pose at the given speed.
@@ -395,63 +615,6 @@ class ExperimentController(BreatheAndGazeController):
         self.close_gripper()
         self.get_logger().info("Picked up the object.")
     
-    def create_hold_csc(self, object_pose=None, speed=None, minimize_wrist_rotation=True):
-        """
-        Return cubic spline controller that guides the robot to hold an object in the given pose at the given speed.
-
-        Args:
-            object_pose (np.array, optional): The position and orientation in the base frame. Defaults to None.
-            speed (Float, optional): The speed at which the end effector would be moving. Defaults to None.
-        """
-        if speed is None:
-            speed = self.speed
-        
-        self.open_gripper_async()
-        
-        if object_pose is None:
-            object_pose = self.discover_object()
-            
-        if len(object_pose) == 7:
-            object_position = object_pose[:3]
-            object_orientation = object_pose[3:]
-        elif len(object_pose) == 3:
-            object_position = object_pose
-            object_orientation = self.camera_towards_board_quat
-        elif len(object_pose) == 16:
-            object_position = object_pose[:3, 3]
-            object_orientation_matrix = object_pose[:3, :3]
-            object_orientation = R.from_matrix(object_orientation_matrix).as_quat()
-        else:
-            self.get_logger().error(f"Invalid object_pose length: {len(object_pose)}. Expected either:\n3 (xyz),\n7 (xyz + xyzw),\n16 (4x4 homogeneous matrix).")
-            return
-        
-        if minimize_wrist_rotation:
-            #rotate around z by 180 degrees if necessary to prevent unnecessary wrist rotation
-            current_orientation_matrix = self.get_current_orientation()
-            object_orientation_matrix = R.from_quat(object_orientation).as_matrix()
-            object_orientation_matrix_rotated =  object_orientation_matrix @ R.from_euler('z', np.pi).as_matrix()
-            
-            current_to_object_orientation = R.from_matrix(current_orientation_matrix.T @ object_orientation_matrix).as_rotvec()
-            current_to_object_orientation_rotated = R.from_matrix(current_orientation_matrix.T @ object_orientation_matrix_rotated).as_rotvec()
-            current_to_object_orientation_norm = np.linalg.norm(current_to_object_orientation)
-            current_to_object_orientation_rotated_norm = np.linalg.norm(current_to_object_orientation_rotated)
-            
-            if current_to_object_orientation_rotated_norm < current_to_object_orientation_norm:
-                object_orientation = R.from_matrix(object_orientation_matrix_rotated).as_quat()
-        
-        current_position = self.get_current_coordinate()
-        movement_direction = (object_position - current_position) * [1.0, 1.0, 0.0]  # Only consider x and y for direction
-        movement_direction /= np.linalg.norm(movement_direction)
-        
-        hold_csc = self.create_cubic_spline_controller(start_point=current_position,
-                                                        end_point=object_position,
-                                                        start_derivative=movement_direction * 0.3,  # Example start derivative
-                                                        end_derivative=[0.0, 0.0, -0.4],  # Example end derivative
-                                                        desired_orientation=object_orientation,
-                                                        speed=speed)
-        
-        return hold_csc    
-    
     def place_object(self, recepticle_position=np.array([0.04, -0.7, 0.2]), speed=None):
         if speed is None:
             speed = self.speed
@@ -466,22 +629,6 @@ class ExperimentController(BreatheAndGazeController):
                                                   speed=speed)
         self.open_gripper()
         self.get_logger().info("Placed the object.")
-
-    def create_place_csc(self, recepticle_position=np.array([0.04, -0.7, 0.2]), speed=None):
-        if speed is None:
-            speed = self.speed
-        
-        _, dropoff_orientation = self.create_downwards_frame(recepticle_position)        
-        dropoff_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(dropoff_orientation).as_matrix()).as_quat()
-        
-        place_csc = self.create_cubic_spline_controller(start_point=self.get_current_coordinate(),
-                                                        end_point=recepticle_position,
-                                                        start_derivative=[0.0, 0.0, 0.2],
-                                                        end_derivative=[0.0, 0.0, -0.2],
-                                                        desired_orientation=dropoff_orientation,
-                                                        speed=speed)
-        
-        return place_csc
 
     def hand_object_over_to_table(self, handover_position=None, handover_orientation=None, speed=None):
         if speed is None:
@@ -516,22 +663,6 @@ class ExperimentController(BreatheAndGazeController):
         self.get_logger().info("Handed over the object.")
         
         self.close_gripper_async()
-
-    def calculate_downward_handover_pose(self):
-        hand_in_base_position = self.get_hand_position_in_base()
-        hand_in_base_position[2] += 0.07  # Raise the hand position slightly to avoid collision
-        hand_in_world_position, handover_orientation_in_world = self.create_downwards_frame(hand_in_base_position)
-        hand_in_base_position = (self.world_to_base_homogeneous @ np.array([hand_in_world_position[0], hand_in_world_position[1], hand_in_world_position[2], 1.0]).T)[:3]
-        handover_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(handover_orientation_in_world).as_matrix()).as_quat()
-        
-        return hand_in_base_position, handover_orientation
-    
-    def calculate_outward_handover_pose(self):
-        hand_in_base_position = self.get_hand_position_in_base()
-        hand_in_base_position[2] += 0.025  # Raise the hand position slightly to avoid collision
-        hand_in_base_position, handover_orientation_in_base = self.create_outwards_frame(hand_in_base_position)
-        
-        return hand_in_base_position, handover_orientation_in_base
         
     def hand_object_over_to_hand(self, speed=None):
         if speed is None:
@@ -576,25 +707,7 @@ class ExperimentController(BreatheAndGazeController):
         time.sleep(0.5)  # Wait for a moment to ensure the hand has taken the object
         self.open_gripper()        
         self.get_logger().info("Handed over the object to the hand.")
-    
-    def create_handover_to_hand_csc(self, speed=None):
-        if speed is None:
-            speed = self.speed
-        
-        hand_in_base_position, handover_orientation = self.calculate_outward_handover_pose()
-        
-        current_position = self.get_current_coordinate()
-        movement_direction = (hand_in_base_position - current_position) * [1.0, 1.0, 0.0]  # Only consider x and y for direction
-        movement_direction /= np.linalg.norm(movement_direction)
-        
-        cubic_spline_controller = self.create_cubic_spline_controller(start_point=current_position,
-                                                                      end_point=hand_in_base_position,
-                                                                      start_derivative= [0.0, 0.0, 0.4],#movement_direction * 0.3,  # Example start derivative
-                                                                      end_derivative=[0.0, 0.0, -0.2],  # Example end derivative
-                                                                      desired_orientation=handover_orientation,
-                                                                      speed=speed)
-        return cubic_spline_controller
-    
+
     def discover_and_hold_object(self, speed=None):
         """
         Discover an object and hold it.
@@ -617,33 +730,19 @@ class ExperimentController(BreatheAndGazeController):
         pickup_pose = np.concatenate((object_position_in_base, pickup_orientation))
         
         self.hold_object(object_pose=pickup_pose, speed=speed, minimize_wrist_rotation=False)
-        
-    def discover_and_create_hold_csc(self, speed=None):
-            """
-            Discover an object and return the cubic spline controller for holding it.
     
-            Args:
-                speed (float, optional): The speed at which the robot will move. Defaults to controller speed.
-            """
-            if speed is None:
-                speed = self.speed
-                
-            object_position = self.discover_object()
-            if object_position is None:
-                self.get_logger().warn("Can't find and pick up object because no suitable object was found.")
-                return None
-            
-            object_position_in_base = (self.world_to_base_homogeneous @ np.array([object_position[0], object_position[1], object_position[2], 1.0]).T)[:3]
-            object_position_in_base[2] -= 0.04
-            pickup_orientation = self.create_downwards_frame(object_position_in_base)[1]
-            pickup_orientation = R.from_matrix(self.world_to_base_3x3 @ R.from_quat(pickup_orientation).as_matrix()).as_quat()
-            pickup_pose = np.concatenate((object_position_in_base, pickup_orientation))
-            
-            hold_csc = self.create_hold_csc(object_pose=pickup_pose, speed=speed, minimize_wrist_rotation=False)
 
-            return hold_csc
-
-
+    def prepare_log_plots(self):
+        super().prepare_log_plots()
+        
+        if hasattr(self, 'handover_take_buffer') and len(self.handover_take_buffer) > 0:
+            plt.figure(self.figure_index)
+            self.figure_index += 1
+            plt.plot(self.handover_take_buffer, label='Handover Take Effort', color='blue')
+            plt.title('Handover Take Effort Over Time')
+            plt.xlabel('Time Steps')
+            plt.ylabel('Effort Value')
+            plt.legend()
         
 class apf_generator:
     def __init__(self, apf_source_name: str = "", apf_constant: float = 0.01, threshold_distance: float = 0.50, max_force: float = 0.1):
@@ -770,7 +869,7 @@ class machine_csc_executor():
         return joint_velocities
 
 
-def demo_machine(ec: ExperimentController = None):  
+def demo_machine_place(ec: ExperimentController = None):  
     state_0 = "breathing_gazing"
     state_1 = "holding"
     holding_csc_executor = None
@@ -785,28 +884,34 @@ def demo_machine(ec: ExperimentController = None):
     
     current_error = 0.0
     
-    ec.open_gripper()
-    
+    last_breath = False
+        
     ec.state = 0
-    ec.prev_state = 0 #-1
+    ec.prev_state = -1
     tick_counter = 0 #TODO: maybe there is a better way for this 
     
-    breathe_duration = 30.0
-    breathe_start_time = time.time()
+    breathe_duration = 5.0  # seconds
+    start_time = time.time()
     while rclpy.ok():
         joint_velocities = np.zeros(6)
         
         if ec.state == 0:
             if ec.prev_state != ec.state:
                 ec.prev_state = ec.state
-                ec.set_breathing_gazing()
+                ec.set_breathing_gazing(go_home=False)
             
-            if time.time() - breathe_start_time > breathe_duration:
-                ec.state = 5
             joint_velocities = ec.breathe_and_gaze_step()
         
+            if time.time() - ec.breathing_start_time > breathe_duration:
+                if not last_breath:
+                    ec.state = 1
+                else:
+                    ec.state = 5
+        
         elif ec.state == 1:
-            if holding_csc_executor == None:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                ec.open_gripper()
                 holding_csc_executor = machine_csc_executor(name="holding_csc_executor",
                                                             ec=ec,
                                                             csc=ec.discover_and_create_hold_csc(),
@@ -820,21 +925,24 @@ def demo_machine(ec: ExperimentController = None):
                 holding_csc_executor = None
         
         elif ec.state == 2:
-            if placing_csc_executor == None:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
                 placing_csc_executor = machine_csc_executor(name="placing_csc_executor",
                                                             ec=ec,
                                                             csc=ec.create_place_csc(),
                                                             max_error=max_error,
-                                                            next_state=1)
+                                                            next_state=0)
             
             joint_velocities = placing_csc_executor.step()
             
             if placing_csc_executor.exited:
                 ec.open_gripper()
                 placing_csc_executor = None
+                last_breath = True
         
         elif ec.state == 3:
-            if handover_give_csc_executor == None:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
                 tick_counter = 0
                 handover_give_csc_executor = machine_csc_executor(name="handover_give_csc_executor",
                                                                   ec=ec,
@@ -857,19 +965,33 @@ def demo_machine(ec: ExperimentController = None):
             if handover_give_csc_executor.exited:
                 ec.open_gripper(wait_time=0.5)
                 handover_give_csc_executor = None
-                breathe_start_time = time.time()
         
         elif ec.state == 4:
-            pass
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                ec.handover_take_maf.reset()
+                ec.object_taken_from_hand = False
+                ec.open_gripper_async()
+                ec.go_to_home_pos()
+                
+            ec.take_object_from_hand()
+            
+            if ec.object_taken_from_hand:
+                ec.state = 2
         
         elif ec.state == 5:
             ec.stop_movement()
             return
         
+        if ec.prev_state != ec.state:
+            ec.get_logger().info(f"Transitioning to state: {ec.state}")
+            ec.stop_movement()  # Stop movement on state transition
+            joint_velocities = np.zeros(6)
+        
         ec.publish_velocity_command(joint_velocities)
         ec.ros_rate.sleep() 
 
-def machine(ec: ExperimentController = None):  
+def demo_machine_handover_give(ec: ExperimentController = None):  
     state_0 = "breathing_gazing"
     state_1 = "holding"
     holding_csc_executor = None
@@ -884,39 +1006,70 @@ def machine(ec: ExperimentController = None):
     
     current_error = 0.0
     
-    ec.open_gripper()
-    
-    ec.state = 1
+    last_breath = False
+        
+    ec.state = 0
+    ec.prev_state = -1
     tick_counter = 0 #TODO: maybe there is a better way for this 
+    
+    breathe_duration = 5.0  # seconds
+    start_time = time.time()
     while rclpy.ok():
         joint_velocities = np.zeros(6)
         
         if ec.state == 0:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                ec.set_breathing_gazing(go_home=False)
+            
             joint_velocities = ec.breathe_and_gaze_step()
         
+            if time.time() - ec.breathing_start_time > breathe_duration:
+                if not last_breath:
+                    ec.state = 1
+                else:
+                    ec.state = 5
+        
         elif ec.state == 1:
-            if holding_csc_executor == None:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                ec.open_gripper()
                 holding_csc_executor = machine_csc_executor(name="holding_csc_executor",
                                                             ec=ec,
                                                             csc=ec.discover_and_create_hold_csc(),
                                                             max_error=max_error,
-                                                            next_state=3,
-                                                            exit_function=ec.close_gripper)
+                                                            next_state=3)
             
             joint_velocities = holding_csc_executor.step()
+            
+            if holding_csc_executor.exited:
+                ec.close_gripper()
+                holding_csc_executor = None
         
         elif ec.state == 2:
-            pass
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                placing_csc_executor = machine_csc_executor(name="placing_csc_executor",
+                                                            ec=ec,
+                                                            csc=ec.create_place_csc(),
+                                                            max_error=max_error,
+                                                            next_state=0)
+            
+            joint_velocities = placing_csc_executor.step()
+            
+            if placing_csc_executor.exited:
+                ec.open_gripper()
+                placing_csc_executor = None
         
         elif ec.state == 3:
-            if handover_give_csc_executor == None:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
                 tick_counter = 0
                 handover_give_csc_executor = machine_csc_executor(name="handover_give_csc_executor",
                                                                   ec=ec,
                                                                   csc=ec.create_handover_to_hand_csc(),
                                                                   max_error=max_error,
-                                                                  next_state=5,
-                                                                  exit_function=lambda: ec.open_gripper(wait_time=0.5))
+                                                                  next_state=0)
             
             if tick_counter % (ec.control_rate//5) == 0:
                 tick_counter = 0
@@ -930,17 +1083,158 @@ def machine(ec: ExperimentController = None):
             
             tick_counter += 1
         
+            if handover_give_csc_executor.exited:
+                ec.open_gripper(wait_time=0.5)
+                handover_give_csc_executor = None
+                last_breath = True
+        
         elif ec.state == 4:
-            pass
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                ec.handover_take_maf.reset()
+                ec.object_taken_from_hand = False
+                ec.open_gripper_async()
+                ec.go_to_home_pos()
+                
+            ec.take_object_from_hand()
+            
+            if ec.object_taken_from_hand:
+                ec.state = 2
         
         elif ec.state == 5:
             ec.stop_movement()
             return
         
+        if ec.prev_state != ec.state:
+            ec.get_logger().info(f"Transitioning to state: {ec.state}")
+            ec.stop_movement()  # Stop movement on state transition
+            joint_velocities = np.zeros(6)
+        
         ec.publish_velocity_command(joint_velocities)
-        ec.ros_rate.sleep()    
+        ec.ros_rate.sleep() 
+
+def demo_machine_handover_take(ec: ExperimentController = None):  
+    state_0 = "breathing_gazing"
+    state_1 = "holding"
+    holding_csc_executor = None
+    state_2 = "placing"
+    placing_csc_executor = None
+    state_3 = "handover_give"
+    handover_give_csc_executor = None
+    state_4 = "handover_take"
+    handover_take_csc_executor = None
     
+    max_error = 0.001
     
+    current_error = 0.0
+    
+    last_breath = False
+        
+    ec.state = 0
+    ec.prev_state = -1
+    tick_counter = 0 #TODO: maybe there is a better way for this 
+    
+    breathe_duration = 5.0  # seconds
+    start_time = time.time()
+    while rclpy.ok():
+        joint_velocities = np.zeros(6)
+        
+        if ec.state == 0:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                ec.set_breathing_gazing(go_home=False)
+            
+            joint_velocities = ec.breathe_and_gaze_step()
+        
+            if time.time() - ec.breathing_start_time > breathe_duration:
+                if not last_breath:
+                    ec.state = 4
+                else:
+                    ec.state = 5
+        
+        elif ec.state == 1:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                ec.open_gripper()
+                holding_csc_executor = machine_csc_executor(name="holding_csc_executor",
+                                                            ec=ec,
+                                                            csc=ec.discover_and_create_hold_csc(),
+                                                            max_error=max_error,
+                                                            next_state=3)
+            
+            joint_velocities = holding_csc_executor.step()
+            
+            if holding_csc_executor.exited:
+                ec.close_gripper()
+                holding_csc_executor = None
+        
+        elif ec.state == 2:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                placing_csc_executor = machine_csc_executor(name="placing_csc_executor",
+                                                            ec=ec,
+                                                            csc=ec.create_place_csc(),
+                                                            max_error=max_error,
+                                                            next_state=0)
+            
+            joint_velocities = placing_csc_executor.step()
+            
+            if placing_csc_executor.exited:
+                ec.open_gripper()
+                placing_csc_executor = None
+                last_breath = True
+        
+        elif ec.state == 3:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                tick_counter = 0
+                handover_give_csc_executor = machine_csc_executor(name="handover_give_csc_executor",
+                                                                  ec=ec,
+                                                                  csc=ec.create_handover_to_hand_csc(),
+                                                                  max_error=max_error,
+                                                                  next_state=0)
+            
+            if tick_counter % (ec.control_rate//5) == 0:
+                tick_counter = 0
+            
+                if handover_give_csc_executor.current_error > 0.02:
+                    hand_in_base_position, handover_orientation = ec.calculate_outward_handover_pose()
+                    handover_give_csc_executor.csc.set_end_point(hand_in_base_position)
+                    handover_give_csc_executor.csc.set_desired_orientation(handover_orientation)
+            
+            joint_velocities = handover_give_csc_executor.step()
+            
+            tick_counter += 1
+        
+            if handover_give_csc_executor.exited:
+                ec.open_gripper(wait_time=0.5)
+                handover_give_csc_executor = None
+        
+        elif ec.state == 4:
+            if ec.prev_state != ec.state:
+                ec.prev_state = ec.state
+                ec.handover_take_maf.reset()
+                ec.object_taken_from_hand = False
+                ec.open_gripper_async()
+                ec.go_to_home_pos()
+                
+            ec.take_object_from_hand()
+            
+            if ec.object_taken_from_hand:
+                ec.state = 2
+        
+        elif ec.state == 5:
+            ec.stop_movement()
+            return
+        
+        if ec.prev_state != ec.state:
+            ec.get_logger().info(f"Transitioning to state: {ec.state}")
+            ec.stop_movement()  # Stop movement on state transition
+            joint_velocities = np.zeros(6)
+        
+        ec.publish_velocity_command(joint_velocities)
+        ec.ros_rate.sleep() 
+  
 def main(args=None):
     try:
         rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)    
@@ -955,12 +1249,27 @@ def main(args=None):
         print("Starting main.")
                    
         experiment_controller.start_controller(speed=CONTROLLER_SPEED, go_home=True)
+                      
+        experiment_controller.send_experiment_signal(START_VIDEO_RECORDING_SIGNAL)
+                      
+        demo_machine_place(experiment_controller)
+        
+        time.sleep(5.0)  # Wait for a moment before starting the next demo
+        experiment_controller.go_to_home_pos()
+        
+        demo_machine_handover_give(experiment_controller)
+        
+        time.sleep(5.0)  # Wait for a moment before starting the next demo
+        experiment_controller.go_to_home_pos()
                          
-        demo_machine(experiment_controller)
+        demo_machine_handover_take(experiment_controller)
+        
+        experiment_controller.send_experiment_signal(STOP_VIDEO_RECORDING_SIGNAL)
         
         experiment_controller.stop_movement()
     except KeyboardInterrupt:
         experiment_controller.stop_movement()
+        experiment_controller.send_experiment_signal(STOP_VIDEO_RECORDING_SIGNAL)
         print("KeyboardInterrupt received, shutting down...")
     except Exception as e:    
         print("Error in main: ", traceback.format_exc())   

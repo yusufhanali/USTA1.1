@@ -6,3 +6,4 @@ ros_workspace/log/
 **.pt
 **/.vscode/
 **/cgn_pytorch_src/
+data/

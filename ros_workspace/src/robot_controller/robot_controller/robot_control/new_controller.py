@@ -567,7 +567,7 @@ class NewController(Node):
         self.first_movement = True        
         self.prev_velocities = np.zeros(6)
         
-        self.home_pos = np.array([-0.8 + np.pi/2 - 0.3, -1.73, -2.1,  1.1,  1.52, -np.pi])
+        self.home_pos = np.array([-0.8, -1.73, -2.1,  1.1,  1.52, -np.pi])
         self.gripper_length = 0.17
         
         self.marker_array_publisher = self.create_publisher(MarkerArray, "vis_marker_array", 10)

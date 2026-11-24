@@ -53,13 +53,14 @@ if [ $? != 0 ]; then
 
     tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/USTA1.1/ros_workspace/" C-m
     tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
-    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 launch robot_controller realsense_launch_wrist.py"
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 launch robot_controller realsense_launch_both.py"
 
     tmux split-window -v -t $SESSION_UR5E_BRINGUP
 
     tmux send-keys -t $SESSION_UR5E_BRINGUP "export PYTHONPATH=\"\${PYTHONPATH}:/home/kovan/USTA1.1/ros_workspace/src/robot_controller/robot_controller/\"" C-m    
     tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/USTA1.1/ros_workspace/" C-m
     tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run robot_controller video_recorder --ros-args -p camera_name:=ur5e_wrist -p image_topic:=/yifan/wrist/color/image_raw"
 
     tmux select-pane -t 1
 
@@ -68,6 +69,7 @@ if [ $? != 0 ]; then
     tmux send-keys -t $SESSION_UR5E_BRINGUP "export PYTHONPATH=\"\${PYTHONPATH}:/home/kovan/USTA1.1/ros_workspace/src/robot_controller/robot_controller/\"" C-m 
     tmux send-keys -t $SESSION_UR5E_BRINGUP "cd ~/USTA1.1/ros_workspace/" C-m
     tmux send-keys -t $SESSION_UR5E_BRINGUP "source install/setup.bash" C-m
+    tmux send-keys -t $SESSION_UR5E_BRINGUP "ros2 run robot_controller video_recorder --ros-args -p camera_name:=ur5e_overhead -p image_topic:=/hri/overhead/color/image_raw"
 
     tmux resize-pane -t 2 -y 90%
     tmux resize-pane -t 4 -y 90%

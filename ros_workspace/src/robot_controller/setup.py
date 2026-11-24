@@ -34,6 +34,7 @@ setup(
             'grasp_manager = robot_controller.contact_graspnet.grasp:main',
             'object_locator = robot_controller.experiment.object_locator:main',
             'experiment_optitrack = robot_controller.experiment.exp_src_optitrack:main',
+            'video_recorder = robot_controller.data_collection.video_recorder:main',
         ],
     },
 )

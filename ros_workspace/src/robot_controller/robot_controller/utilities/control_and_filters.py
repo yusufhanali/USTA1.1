@@ -181,5 +181,5 @@ def visualize_scaler(scaler, num_points=100):
     plt.show()
     
 if __name__ == "__main__":
-    scaler = WedgeShapedScaler(min_input=0.0, max_input=1.0, entry_distance=0.2, exit_distance=0.2, peak_output=1.0)
+    scaler = LinearScaler(min_input=0.0, max_input=0.3, min_output=3.0, max_output=0.0)
     visualize_scaler(scaler)
