@@ -136,6 +136,7 @@ class UR5eWatchdog(Node):
         self.init_singularity_stuff()
         self.init_wrist1_height_stuff()
         self.init_temp_stuff()
+        self.init_log_buffers()
         
         self.base_to_world_homogeneous = np.array([ # WAS THIS WRONG BEFORE??? THE SIGNS ARE OPPOSITE NOW, LOOK INTO IT
             [-0.7071068, 0.7071068, 0.0, 1.7513],
@@ -155,6 +156,12 @@ class UR5eWatchdog(Node):
                                                                         
         # Sanity check at the end of node. If both of these are printed, then the node is probably working properly.
         self.get_logger().info('but again, when ever is')
+
+    def init_log_buffers(self):
+        self.joint_velocities_real = []
+        self.joint_velocities_sent = []
+        self.log_joint_velocities = False
+        
 
     def joint_state_callback(self, msg):
         # Why does UR5e always send joint states in an order other than 012345? It was 210345 in ROS1 and now this.
@@ -486,6 +493,10 @@ class UR5eWatchdog(Node):
     def publish_velocity_command(self, vels):
         if type(vels) is not np.ndarray:
             vels = np.array(vels)
+        
+        if self.log_joint_velocities:
+            self.joint_velocities_real.append(self.joint_states_global["vels"])
+            self.joint_velocities_sent.append(vels)
          
         vel_msg = Float64MultiArray()
         vel_msg.data = vels
@@ -496,11 +507,46 @@ class UR5eWatchdog(Node):
         vel_msg.data = np.array([0, 0, 0, 0, 0, 0])
         self.velocityControllerPub.publish(vel_msg)
         self.get_logger().info("Movement stopped.")
+   
+   
+    def prepare_log_plots(self):
+        self.figure_index = 0
+        
+        if hasattr(self, 'joint_velocities_sent') and len(self.joint_velocities_sent) > 0:        
+                    self.joint_velocities_sent = np.array(self.joint_velocities_sent)
+                    self.joint_velocities_real = np.array(self.joint_velocities_real)
+                    for i in range(self.joint_velocities_sent.shape[1]):
+                        plt.figure(self.figure_index)
+                        self.figure_index += 1
+                        plt.subplot(2, 1, 1)
+                        plt.plot(self.joint_velocities_sent[:, i], label=f"Sent Joint {i+1}")
+                        plt.title("Sent Joint Velocities Over Time from Watchdog")
+                        plt.xlabel("Time Step")
+                        plt.ylabel("Velocity (rad/s)")
+                        plt.legend()
+                        plt.subplot(2, 1, 2)
+                        plt.plot(self.joint_velocities_real[:, i], label=f"Real Joint {i+1}", color='orange')
+                        plt.title("Real Joint Velocities Over Time from Watchdog")
+                        plt.xlabel("Time Step")
+                        plt.ylabel("Velocity (rad/s)")
+                        plt.legend()
+                        plt.tight_layout()
+                        #plt.show(block=False)
+   
+    def show_log_plots(self):
+        self.prepare_log_plots()
+        
+        if self.figure_index > 0:
+            plt.show()
+
     
     def shutdown_controller(self):
         self.get_logger().info(f"Stopping {self.get_name()}...")
         
         self.stop_movement()
+        
+        self.show_log_plots()
+        
         self.get_logger().info('Shutting down watchdog...')
         self.destroy_node()
 

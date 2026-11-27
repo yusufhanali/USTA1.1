@@ -62,14 +62,19 @@ class ExperimentController(BreatheAndGazeController):
     def init_log_buffers(self):        
         super().init_log_buffers()
         
-        self.handover_take_buffer = []
+        self.handover_take_maf_effort_buffer = []
+        self.handover_take_current_effort_buffer = []
+        self.log_handover_take_effort = False
     
-#signaling
+#experiment helpers and signaling
     def send_experiment_signal(self, signal):
         msg = String()
         msg.data = signal
         self.experiment_signals_publisher.publish(msg)
         self.get_logger().info(f"Sent experiment signal: {signal}")
+    
+    def change_state(self, state):
+        self.state = state
     
 #pose and related helpers
     def create_gaze_frame(self, position_in_base):
@@ -550,9 +555,15 @@ class ExperimentController(BreatheAndGazeController):
             return hold_csc
 
     def take_object_from_hand(self):
-        effort_val = self.handover_take_maf.filter(self.joint_states_global["effs"][3])
+        current_effort = self.joint_states_global["effs"][3]
+        maf_effort = self.handover_take_maf.filter(current_effort)
+        if len(self.handover_take_maf.values) < self.handover_take_maf.window_size:
+            return
+        if self.log_handover_take_effort:
+            self.handover_take_maf_effort_buffer.append(maf_effort)
+            self.handover_take_current_effort_buffer.append(current_effort)
         
-        if effort_val < 0.1 and len(self.handover_take_maf.values) == self.handover_take_maf.window_size:
+        if (maf_effort - current_effort) > 0.05:
             self.close_gripper()
             self.object_taken_from_hand = True
         
@@ -735,10 +746,11 @@ class ExperimentController(BreatheAndGazeController):
     def prepare_log_plots(self):
         super().prepare_log_plots()
         
-        if hasattr(self, 'handover_take_buffer') and len(self.handover_take_buffer) > 0:
+        if hasattr(self, 'handover_take_maf_effort_buffer') and len(self.handover_take_maf_effort_buffer) > 0:
             plt.figure(self.figure_index)
             self.figure_index += 1
-            plt.plot(self.handover_take_buffer, label='Handover Take Effort', color='blue')
+            plt.plot(self.handover_take_maf_effort_buffer, label='Handover Take Averaged Effort', color='blue')
+            plt.plot(self.handover_take_current_effort_buffer, label='Handover Take Current Effort', color='orange')
             plt.title('Handover Take Effort Over Time')
             plt.xlabel('Time Steps')
             plt.ylabel('Effort Value')
@@ -796,7 +808,7 @@ def observer(experiment_controller: ExperimentController = None, frequency: int 
             
         experiment_controller.joint_velocity_additive_modifier = apf_joint_velocity_command
 
-    human_distance_speed_scaler = cf.LinearScaler(min_input=1.2, max_input=2.4, min_output=0.5, max_output=1.0)
+    human_distance_speed_scaler = cf.LinearScaler(min_input=1.2, max_input=2.4, min_output=0.3, max_output=1.0)
     speed_scale_smoother = cf.LinearFilter(alpha=0.5)
     def speed_setter():
         human_position_in_base = experiment_controller.tfBuffer.lookup_transform(experiment_controller.base, experiment_controller.gaze_target_name, rclpy.time.Time())
@@ -869,7 +881,7 @@ class machine_csc_executor():
         return joint_velocities
 
 
-def demo_machine_place(ec: ExperimentController = None):  
+def demo_machine(ec: ExperimentController = None):  
     state_0 = "breathing_gazing"
     state_1 = "holding"
     holding_csc_executor = None
@@ -890,7 +902,7 @@ def demo_machine_place(ec: ExperimentController = None):
     ec.prev_state = -1
     tick_counter = 0 #TODO: maybe there is a better way for this 
     
-    breathe_duration = 5.0  # seconds
+    breathe_duration = 60.0  # seconds
     start_time = time.time()
     while rclpy.ok():
         joint_velocities = np.zeros(6)
@@ -911,18 +923,22 @@ def demo_machine_place(ec: ExperimentController = None):
         elif ec.state == 1:
             if ec.prev_state != ec.state:
                 ec.prev_state = ec.state
-                ec.open_gripper()
-                holding_csc_executor = machine_csc_executor(name="holding_csc_executor",
-                                                            ec=ec,
-                                                            csc=ec.discover_and_create_hold_csc(),
-                                                            max_error=max_error,
-                                                            next_state=2)
-            
-            joint_velocities = holding_csc_executor.step()
-            
-            if holding_csc_executor.exited:
-                ec.close_gripper()
-                holding_csc_executor = None
+                hold_csc = ec.discover_and_create_hold_csc()
+                if hold_csc is None:
+                    ec.state = 0
+                else:
+                    ec.open_gripper()
+                    holding_csc_executor = machine_csc_executor(name="holding_csc_executor",
+                                                                ec=ec,
+                                                                csc=hold_csc,
+                                                                max_error=max_error,
+                                                                next_state=3)
+            else:            
+                joint_velocities = holding_csc_executor.step()
+                
+                if holding_csc_executor.exited:
+                    ec.close_gripper()
+                    holding_csc_executor = None
         
         elif ec.state == 2:
             if ec.prev_state != ec.state:
@@ -948,7 +964,7 @@ def demo_machine_place(ec: ExperimentController = None):
                                                                   ec=ec,
                                                                   csc=ec.create_handover_to_hand_csc(),
                                                                   max_error=max_error,
-                                                                  next_state=0)
+                                                                  next_state=4)
             
             if tick_counter % (ec.control_rate//5) == 0:
                 tick_counter = 0
@@ -991,7 +1007,8 @@ def demo_machine_place(ec: ExperimentController = None):
         ec.publish_velocity_command(joint_velocities)
         ec.ros_rate.sleep() 
 
-def demo_machine_handover_give(ec: ExperimentController = None):  
+
+def visitor_demo_machine(ec: ExperimentController = None):  
     state_0 = "breathing_gazing"
     state_1 = "holding"
     holding_csc_executor = None
@@ -1012,7 +1029,7 @@ def demo_machine_handover_give(ec: ExperimentController = None):
     ec.prev_state = -1
     tick_counter = 0 #TODO: maybe there is a better way for this 
     
-    breathe_duration = 5.0  # seconds
+    breathe_duration = 25.0  # seconds
     start_time = time.time()
     while rclpy.ok():
         joint_velocities = np.zeros(6)
@@ -1033,140 +1050,22 @@ def demo_machine_handover_give(ec: ExperimentController = None):
         elif ec.state == 1:
             if ec.prev_state != ec.state:
                 ec.prev_state = ec.state
-                ec.open_gripper()
-                holding_csc_executor = machine_csc_executor(name="holding_csc_executor",
-                                                            ec=ec,
-                                                            csc=ec.discover_and_create_hold_csc(),
-                                                            max_error=max_error,
-                                                            next_state=3)
-            
-            joint_velocities = holding_csc_executor.step()
-            
-            if holding_csc_executor.exited:
-                ec.close_gripper()
-                holding_csc_executor = None
-        
-        elif ec.state == 2:
-            if ec.prev_state != ec.state:
-                ec.prev_state = ec.state
-                placing_csc_executor = machine_csc_executor(name="placing_csc_executor",
-                                                            ec=ec,
-                                                            csc=ec.create_place_csc(),
-                                                            max_error=max_error,
-                                                            next_state=0)
-            
-            joint_velocities = placing_csc_executor.step()
-            
-            if placing_csc_executor.exited:
-                ec.open_gripper()
-                placing_csc_executor = None
-        
-        elif ec.state == 3:
-            if ec.prev_state != ec.state:
-                ec.prev_state = ec.state
-                tick_counter = 0
-                handover_give_csc_executor = machine_csc_executor(name="handover_give_csc_executor",
-                                                                  ec=ec,
-                                                                  csc=ec.create_handover_to_hand_csc(),
-                                                                  max_error=max_error,
-                                                                  next_state=0)
-            
-            if tick_counter % (ec.control_rate//5) == 0:
-                tick_counter = 0
-            
-                if handover_give_csc_executor.current_error > 0.02:
-                    hand_in_base_position, handover_orientation = ec.calculate_outward_handover_pose()
-                    handover_give_csc_executor.csc.set_end_point(hand_in_base_position)
-                    handover_give_csc_executor.csc.set_desired_orientation(handover_orientation)
-            
-            joint_velocities = handover_give_csc_executor.step()
-            
-            tick_counter += 1
-        
-            if handover_give_csc_executor.exited:
-                ec.open_gripper(wait_time=0.5)
-                handover_give_csc_executor = None
-                last_breath = True
-        
-        elif ec.state == 4:
-            if ec.prev_state != ec.state:
-                ec.prev_state = ec.state
-                ec.handover_take_maf.reset()
-                ec.object_taken_from_hand = False
-                ec.open_gripper_async()
-                ec.go_to_home_pos()
-                
-            ec.take_object_from_hand()
-            
-            if ec.object_taken_from_hand:
-                ec.state = 2
-        
-        elif ec.state == 5:
-            ec.stop_movement()
-            return
-        
-        if ec.prev_state != ec.state:
-            ec.get_logger().info(f"Transitioning to state: {ec.state}")
-            ec.stop_movement()  # Stop movement on state transition
-            joint_velocities = np.zeros(6)
-        
-        ec.publish_velocity_command(joint_velocities)
-        ec.ros_rate.sleep() 
-
-def demo_machine_handover_take(ec: ExperimentController = None):  
-    state_0 = "breathing_gazing"
-    state_1 = "holding"
-    holding_csc_executor = None
-    state_2 = "placing"
-    placing_csc_executor = None
-    state_3 = "handover_give"
-    handover_give_csc_executor = None
-    state_4 = "handover_take"
-    handover_take_csc_executor = None
-    
-    max_error = 0.001
-    
-    current_error = 0.0
-    
-    last_breath = False
-        
-    ec.state = 0
-    ec.prev_state = -1
-    tick_counter = 0 #TODO: maybe there is a better way for this 
-    
-    breathe_duration = 5.0  # seconds
-    start_time = time.time()
-    while rclpy.ok():
-        joint_velocities = np.zeros(6)
-        
-        if ec.state == 0:
-            if ec.prev_state != ec.state:
-                ec.prev_state = ec.state
-                ec.set_breathing_gazing(go_home=False)
-            
-            joint_velocities = ec.breathe_and_gaze_step()
-        
-            if time.time() - ec.breathing_start_time > breathe_duration:
-                if not last_breath:
-                    ec.state = 4
+                hold_csc = ec.discover_and_create_hold_csc()
+                if hold_csc is None:
+                    ec.state = 0
                 else:
-                    ec.state = 5
-        
-        elif ec.state == 1:
-            if ec.prev_state != ec.state:
-                ec.prev_state = ec.state
-                ec.open_gripper()
-                holding_csc_executor = machine_csc_executor(name="holding_csc_executor",
-                                                            ec=ec,
-                                                            csc=ec.discover_and_create_hold_csc(),
-                                                            max_error=max_error,
-                                                            next_state=3)
-            
-            joint_velocities = holding_csc_executor.step()
-            
-            if holding_csc_executor.exited:
-                ec.close_gripper()
-                holding_csc_executor = None
+                    ec.open_gripper()
+                    holding_csc_executor = machine_csc_executor(name="holding_csc_executor",
+                                                                ec=ec,
+                                                                csc=hold_csc,
+                                                                max_error=max_error,
+                                                                next_state=3)
+            else:            
+                joint_velocities = holding_csc_executor.step()
+                
+                if holding_csc_executor.exited:
+                    ec.close_gripper()
+                    holding_csc_executor = None
         
         elif ec.state == 2:
             if ec.prev_state != ec.state:
@@ -1182,6 +1081,7 @@ def demo_machine_handover_take(ec: ExperimentController = None):
             if placing_csc_executor.exited:
                 ec.open_gripper()
                 placing_csc_executor = None
+                breathe_duration = 600
                 last_breath = True
         
         elif ec.state == 3:
@@ -1192,7 +1092,7 @@ def demo_machine_handover_take(ec: ExperimentController = None):
                                                                   ec=ec,
                                                                   csc=ec.create_handover_to_hand_csc(),
                                                                   max_error=max_error,
-                                                                  next_state=0)
+                                                                  next_state=4)
             
             if tick_counter % (ec.control_rate//5) == 0:
                 tick_counter = 0
@@ -1250,20 +1150,8 @@ def main(args=None):
                    
         experiment_controller.start_controller(speed=CONTROLLER_SPEED, go_home=True)
                       
-        experiment_controller.send_experiment_signal(START_VIDEO_RECORDING_SIGNAL)
-                      
-        demo_machine_place(experiment_controller)
-        
-        time.sleep(5.0)  # Wait for a moment before starting the next demo
-        experiment_controller.go_to_home_pos()
-        
-        demo_machine_handover_give(experiment_controller)
-        
-        time.sleep(5.0)  # Wait for a moment before starting the next demo
-        experiment_controller.go_to_home_pos()
-                         
-        demo_machine_handover_take(experiment_controller)
-        
+        experiment_controller.send_experiment_signal(START_VIDEO_RECORDING_SIGNAL)                      
+        visitor_demo_machine(experiment_controller)        
         experiment_controller.send_experiment_signal(STOP_VIDEO_RECORDING_SIGNAL)
         
         experiment_controller.stop_movement()
